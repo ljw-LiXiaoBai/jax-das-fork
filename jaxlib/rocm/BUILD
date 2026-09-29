@@ -511,6 +511,39 @@ rocm_nanobind_extension(
 )
 
 cc_library(
+    name = "hip_fa_attention_kernel",
+    srcs = ["//jaxlib/gpu:fa_attention_kernel.cc"],
+    hdrs = [
+        "//jaxlib/gpu:fa_attention_kernel.h",
+        "//jaxlib/gpu:flash.h",
+    ],
+    deps = [
+        "@local_config_rocm//rocm:hip_runtime",
+        "@local_config_rocm//rocm:rocm_headers",
+        "@xla//xla/ffi/api:ffi",
+    ],
+)
+
+rocm_nanobind_extension(
+    name = "fa_attention",
+    srcs = ["//jaxlib/gpu:fa_attention.cc"],
+    copts = [
+        "-fexceptions",
+        "-fno-strict-aliasing",
+    ],
+    enable_stub_generation = False,
+    features = ["-use_header_modules"],
+    linkopts = ["-ldl"],
+    module_name = "fa_attention",
+    deps = [
+        ":hip_fa_attention_kernel",
+        "//jaxlib:kernel_nanobind_helpers",
+        "@local_config_rocm//rocm:rocm_headers",
+        "@nanobind",
+    ],
+)
+
+cc_library(
     name = "triton_kernels",
     srcs = ["//jaxlib/gpu:triton_kernels.cc"],
     hdrs = ["//jaxlib/gpu:triton_kernels.h"],
@@ -592,6 +625,7 @@ py_library(
         ":_sparse",
         ":_triton",
         ":cutlass_fa",
+        ":fa_attention",
         ":miopen_mha",
     ],
 )

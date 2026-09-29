@@ -1033,7 +1033,7 @@ def dot_product_attention(
     query_seq_lengths: ArrayLike | None = None,
     key_value_seq_lengths: ArrayLike | None = None,
     local_window_size: int | tuple[int, int] | None = None,
-    implementation: Literal['xla', 'cudnn', 'miopen', 'cutlass'] | None = None,
+    implementation: Literal['xla', 'cudnn', 'miopen', 'cutlass', 'hipc'] | None = None,
     return_residual: Literal[False] = ...,
 ) -> Array: ...
 
@@ -1050,7 +1050,7 @@ def dot_product_attention(
     query_seq_lengths: ArrayLike | None = None,
     key_value_seq_lengths: ArrayLike | None = None,
     local_window_size: int | tuple[int, int] | None = None,
-    implementation: Literal['xla', 'cudnn', 'miopen', 'cutlass'] | None = None,
+    implementation: Literal['xla', 'cudnn', 'miopen', 'cutlass', 'hipc'] | None = None,
     return_residual: Literal[True] = ...,
 ) -> tuple[Array, Array]: ...
 
@@ -1066,7 +1066,7 @@ def dot_product_attention(
     query_seq_lengths: ArrayLike | None = None,
     key_value_seq_lengths: ArrayLike | None = None,
     local_window_size: int | tuple[int, int] | None = None,
-    implementation: Literal['xla', 'cudnn', 'miopen', 'cutlass'] | None = None,
+    implementation: Literal['xla', 'cudnn', 'miopen', 'cutlass', 'hipc'] | None = None,
     return_residual: bool = False,
 ):
   r"""Scaled dot product attention function.
@@ -1132,7 +1132,13 @@ def dot_product_attention(
       https://arxiv.org/pdf/2307.08691 to find the definition of logsumexp.
     implementation: A string to control which implementation backend to use.
       Supported strings are `xla`, `cudnn` (cuDNN flash attention), `miopen`
-      (DTK MIOpen flash attention), and `cutlass` (DTK Cutlass flash attention).
+      (DTK MIOpen flash attention), `cutlass` (DTK Cutlass flash attention),
+      and `hipc` (HIPC FlashAttention). 显式指定 `hipc` 时，支持 fp16/bf16、
+      [32,256] 内为 32 倍数的头维度及 MHA/GQA/MQA；缩放值须为静态有限正数，
+      不支持 bias 或任意矩阵掩码。支持独立的 int32 序列长度：查询长度可为零，
+      KV 长度须为正；因果或局部注意力要求非空查询样本的 Q/K 有效长度相等。
+      运行时长度校验存在设备流同步和主机复制开销。残差采用 BTN 布局和查询
+      类型，并停止梯度；填充查询的残差使用与 `xla` 相同的哨兵值。
       It defaults
       to `None`, which currently falls back to `xla`.
       Note, `cudnn` supports only a subset of shapes/dtypes, and an exception
@@ -1157,6 +1163,15 @@ def dot_product_attention(
   value_arr = _ensure_4d(value)
   bias = _ensure_4d(bias) if bias is not None else None
   mask = _ensure_4d(mask) if mask is not None else None
+  if implementation == 'hipc' and (
+      query_seq_lengths is not None or key_value_seq_lengths is not None):
+    # 在 jnp.asarray 转换前检查类型，避免关闭 x64 时主机 int64 长度被隐式缩窄。
+    from jax._src.cudnn.fa_attention import _length_array
+    if query_seq_lengths is not None:
+      query_seq_lengths = _length_array(query_seq_lengths, 'query_seq_lengths')
+    if key_value_seq_lengths is not None:
+      key_value_seq_lengths = _length_array(
+          key_value_seq_lengths, 'key_value_seq_lengths')
   if query_seq_lengths is not None:
     query_seq_lengths = jnp.asarray(query_seq_lengths)
   if key_value_seq_lengths is not None:
@@ -1240,6 +1255,16 @@ def dot_product_attention(
         out, residual = out
         residual = jnp.transpose(residual, (0, 2, 1)).astype(out.dtype)
         out = (out, residual)
+    case 'hipc':
+      # 延迟导入可选 HIPC 插件，避免其他注意力后端依赖该插件。
+      from jax._src.cudnn.fa_attention import (
+          dot_product_attention as hipc_dot_product_attention)
+      out = hipc_dot_product_attention(
+          query_arr, key_arr, value_arr, bias, mask,
+          query_seq_lengths, key_value_seq_lengths, scale=scale_val,
+          is_causal=is_causal, local_window_size=local_window_size,
+          return_residual=return_residual,
+      )
     case 'miopen' | 'cutlass':
       if return_residual:
         raise NotImplementedError(

@@ -2137,6 +2137,83 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
+    name = "fa_attention_test",
+    srcs = ["fa_attention_test.py"],
+    enable_backends = ["gpu"],
+    tags = ["manual"],
+    deps = ["//jax/_src:cudnn"] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
+    name = "fa_attn_length_test",
+    srcs = ["fa_attn_length_test.py"],
+    enable_backends = ["gpu"],
+    tags = ["manual"],
+    deps = ["//jax/_src:cudnn"] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
+    name = "fa_fp8_test",
+    srcs = ["fa_fp8_test.py"],
+    enable_backends = ["gpu"],
+    tags = ["manual"],
+    deps = ["//jax/_src:cudnn"] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
+    name = "fa_varlen_ad_test",
+    srcs = ["fa_varlen_ad_test.py"],
+    enable_backends = ["gpu"],
+    tags = ["manual"],
+    deps = ["//jax/_src:cudnn"] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
+    name = "fa_dpa_test",
+    srcs = ["fa_dpa_test.py"],
+    enable_backends = ["gpu"],
+    tags = ["manual"],
+    deps = ["//jax/_src:cudnn"] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
+    name = "fa_batching_test",
+    srcs = ["fa_batching_test.py"],
+    enable_backends = ["gpu"],
+    tags = ["manual"],
+    deps = ["//jax/_src:cudnn"] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
+    name = "fa_length_extended_test",
+    srcs = ["fa_length_extended_test.py"],
+    enable_backends = ["gpu"],
+    tags = ["manual"],
+    deps = ["//jax/_src:cudnn"] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
     name = "fused_attention_stablehlo_test",
     srcs = ["fused_attention_stablehlo_test.py"],
     enable_backends = ["gpu"],
