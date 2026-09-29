@@ -141,6 +141,7 @@ maintains an up-to-date list.
    jax
    contributor_guide
    extensions
+   rocm_flash_attention
    notes
    pallas/index
    about

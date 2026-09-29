@@ -79,6 +79,10 @@ exports_files(srcs = [
     "cutlass_fa.cc",
     "cutlass_fa_kernel.cc",
     "cutlass_fa_kernel.h",
+    "fa_attention.cc",
+    "fa_attention_kernel.cc",
+    "fa_attention_kernel.h",
+    "flash.h",
     "vendor.h",
 ])
 
