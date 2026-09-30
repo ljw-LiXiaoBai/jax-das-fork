@@ -205,6 +205,7 @@ def prepare_wheel_rocm(
           f"{source_file_prefix}jaxlib/rocm/_rnn.{pyext}",
           f"{source_file_prefix}jaxlib/rocm/_triton.{pyext}",
           f"{source_file_prefix}jaxlib/rocm/cutlass_fa.{pyext}",
+          f"{source_file_prefix}jaxlib/rocm/fa_attention.{pyext}",
           f"{source_file_prefix}jaxlib/rocm/miopen_mha.{pyext}",
           f"{source_file_prefix}jaxlib/rocm/rocm_plugin_extension.{pyext}",
           f"{source_file_prefix}jaxlib/version.py",
