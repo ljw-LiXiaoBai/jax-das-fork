@@ -155,7 +155,9 @@ jobs:
         working-directory: jax-das
         run: |
           source /opt/dtk/env.sh
-          bash scripts/run_full_dtk_csv_tests.sh
+          export GPU_IDS=0,1,2,3
+          export PROCS_PER_GPU=1
+          bash scripts/run_full_dtk_csv_tests_parallel.sh
 
       # run_full_dtk_csv_tests.sh keeps going after failures and always exits 0,
       # so the job result has to be derived from its summary.
