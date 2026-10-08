@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
 // 向 Python 导出 ROCM 调用目标及架构探测接口。
 // registrations() 返回 {平台: [(名称, capsule, api_version)]}；
 // 0 表示旧式自定义调用，1 表示类型化 FFI。

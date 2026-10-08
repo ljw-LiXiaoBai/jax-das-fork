@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+
 """HIPC FlashAttention 的 JAX 接入层。
 
 提供稠密、变长、分页缓存及 FP8 注意力接口，约束和求导范围见各接口。

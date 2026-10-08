@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
 // =============================================================================
 // fa_attention_kernel.cc — Hygon FlashAttention C 库 → XLA FFI/legacy custom call 胶水
 // =============================================================================

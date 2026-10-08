@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+
 # HIPC FlashAttention for the DTK JAX fork
 
 This module integrates the current vendor `libflash_attention.so.1` into JAX

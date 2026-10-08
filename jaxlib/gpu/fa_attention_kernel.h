@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
 // Hygon FlashAttention 的 XLA 调用入口。
 // api_version=0 使用旧式 ABI：buffers 按操作数、结果的顺序排列，
 // opaque 的字段顺序须与 Python 打包格式一致，stream 由 XLA 提供。
