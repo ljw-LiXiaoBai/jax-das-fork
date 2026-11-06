@@ -649,7 +649,7 @@ class PythonCallbackTest(jtu.JaxTestCase):
     @jax.jit
     def f(x):
       return jax.pure_callback(
-          callback, jax.ShapeDtypeStruct(x.shape, x.dtype), x
+          callback, jax.ShapeDtypeStruct.like(x), x
       )
 
     result = f(x)
@@ -663,7 +663,7 @@ class PythonCallbackTest(jtu.JaxTestCase):
     @jax.jit
     def f(x):
       return jax.pure_callback(
-          callback, jax.ShapeDtypeStruct(x.shape, x.dtype), x
+          callback, jax.ShapeDtypeStruct.like(x), x
       )
 
     result = f(x)
@@ -1068,7 +1068,7 @@ class PureCallbackTest(jtu.JaxTestCase):
       return np.asarray(2 * jnp.log(y))
 
     x = jnp.array([1.0, 2.0, 3.0, 4.0])
-    out = jax.pure_callback(f, jax.ShapeDtypeStruct(x.shape, x.dtype), x)
+    out = jax.pure_callback(f, jax.ShapeDtypeStruct.like(x), x)
     np.testing.assert_allclose(out, 2 * jnp.log(x + 1))
 
   def test_vmap_method_raise(self):
@@ -1117,7 +1117,7 @@ class PureCallbackTest(jtu.JaxTestCase):
       self.assertEqual(x.dtype, jnp.complex64)
       out_type = (
           jax.ShapeDtypeStruct(x.shape[:-1], x.dtype),
-          jax.ShapeDtypeStruct(x.shape, x.dtype),
+          jax.ShapeDtypeStruct.like(x),
       )
       return jax.pure_callback(callback, out_type, x)
 
@@ -1323,6 +1323,27 @@ class IOCallbackTest(jtu.JaxTestCase):
           stablehlo_ir)
     else:
       self.assertIn(f"{{maximal device={callback_device_index}}}", stablehlo_ir)
+
+  def test_ordered_io_callback_maximal_token(self):
+    devices = jax.devices()
+    mesh = Mesh(np.array(devices), ["x"])
+
+    def cb(x):
+      return x + 1.0
+
+    @functools.partial(
+        jax.jit,
+        in_shardings=jax.NamedSharding(mesh, jax.P("x")),
+        out_shardings=jax.NamedSharding(mesh, jax.P()),
+    )
+    def f(x):
+      return io_callback(
+          cb, jax.ShapeDtypeStruct(x.shape, x.dtype), x, ordered=True)
+
+    with mesh:
+      x = jnp.arange(mesh.size, dtype=jnp.float32)
+      res = f(x)
+      self.assertAllClose(res, x + 1.0)
 
   @jtu.ignore_warning(message='.*Please use `jax.jit` instead.*',
                       category=DeprecationWarning)

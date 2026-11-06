@@ -32,7 +32,6 @@ from absl.testing import absltest
 import jax
 from jax import jit
 from jax._src import profiler
-from jax._src.lib import jaxlib_extension_version as jaxlib_extension_version
 import jax._src.test_util as jtu
 import jax.numpy as jnp
 import jax.profiler
@@ -160,10 +159,6 @@ class ProfilerTest(unittest.TestCase):
       self.assertIn(b"pxla.py", proto)
 
   @unittest.skipIf(not portpicker, "Test requires portpicker")
-  @unittest.skipUnless(
-      jaxlib_extension_version >= 448,
-      "Subprocess profiling requires jaxlib version 448 or later",
-  )
   def testSubprocessProfiling(self):
     """Test that subprocess profiling works correctly and aggregates results."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -274,9 +269,10 @@ class ProfilerTest(unittest.TestCase):
     # Tests stop_and_get_fod_profile could run.
     try:
       jax.profiler.start_trace("test")
-      jax.pmap(lambda x: jax.lax.psum(x + 1, "i"), axis_name="i")(
+      out = jax.pmap(lambda x: jax.lax.psum(x + 1, "i"), axis_name="i")(
           jnp.ones(jax.local_device_count())
       )
+      jax.block_until_ready(out)
     finally:
       fdo_profile = profiler.stop_and_get_fdo_profile()
     if jtu.test_device_matches(["gpu"]) and jtu.is_device_cuda():

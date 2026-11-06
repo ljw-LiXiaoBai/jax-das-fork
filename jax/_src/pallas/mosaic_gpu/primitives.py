@@ -38,6 +38,7 @@ from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith as arith_dialect
 from jax._src.lib.mlir.dialects import builtin as builtin_dialect
 from jax._src.lib.mlir.dialects import gpu as gpu_dialect
+from jax._src.lib.mlir.dialects import llvm as llvm_dialect
 from jax._src.lib.mlir.dialects import nvvm as nvvm_dialect
 from jax._src.lib.mlir.dialects import vector as vector_dialect
 from jax._src.pallas import core as pallas_core
@@ -221,15 +222,6 @@ def _copy_smem_to_gmem_lowering(
   else:
     predicate = None
 
-  if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
-    if predicate is not None:
-      assert ctx.module_ctx.single_lane_predicate is not None
-      predicate = arith_dialect.andi(
-          predicate, ctx.module_ctx.single_lane_predicate
-      )
-    else:
-      predicate = ctx.module_ctx.single_lane_predicate
-
   flat_src_transforms, flat_dst_transforms = util.split_list(
       flat_args,
       [src_transforms_treedef.num_leaves],
@@ -260,15 +252,35 @@ def _copy_smem_to_gmem_lowering(
       **_extract_gmem_copy_params(ctx, dst_transforms, dst_transform_avals, supports_multicast=True),
       **_extract_smem_copy_params(src_aval, src_transforms),
   }
+  is_scatter = False
+  if gmem_slice := copy_params.get("gmem_slice", ()):
+    first_idx = gmem_slice[0]
+    if isinstance(first_idx, mgpu.FragmentedArray) and first_idx.shape:
+      is_scatter = True
+
+  if is_scatter:
+    if predicate is not None:
+      raise NotImplementedError("Gather/scatter TMA does not support predicates yet.")
+    if ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp:
+      raise ValueError("Gather/scatter operations are not supported in a warp context.")
+
   if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
+    if not is_scatter:
+      lane_pred = ctx.module_ctx.single_lane_predicate
+      assert lane_pred is not None  # Satisfy pytype
+      if predicate is not None:
+        predicate = arith_dialect.andi(predicate, lane_pred)
+      else:
+        predicate = lane_pred
+
     ctx.launch_ctx.async_copy(
         src_ref=src,
         dst_ref=dst,
-        predicate=predicate,
         arrive=commit_group,
         reduction_op=reduction_op,
         oob_mode=OOBFillMode.UNDEFINED,
         **copy_params,
+        **(dict(predicate=predicate) if predicate is not None else {}),  # pyrefly: ignore[bad-argument-type]
     )
     return ()
 
@@ -293,16 +305,6 @@ def _copy_smem_to_gmem_lowering(
   else:
     reduction_op_attr = None
 
-  # TODO(olechwierowicz): Remove this once min jaxlib version is 0.10.1
-  if hasattr(mgpu.dialect.AsyncStoreOp, "gmem_peer_id") and hasattr(
-      mgpu.dialect.AsyncStoreOp, "is_global_broadcast"
-  ):
-    kwargs = {
-        "gmem_peer_id": peer_id,
-        "is_global_broadcast": is_global_broadcast,
-    }
-  else:
-    kwargs = {}
   mgpu.dialect.async_store(
       src,
       dst,
@@ -311,7 +313,8 @@ def _copy_smem_to_gmem_lowering(
       predicate=predicate,
       commit_group=commit_group,
       reduction_op=reduction_op_attr,
-      **kwargs  # pyrefly: ignore[bad-argument-type]
+      gmem_peer_id=peer_id,
+      is_global_broadcast=is_global_broadcast,
   )
   return ()
 
@@ -2851,7 +2854,7 @@ def _set_max_registers_lowering(
 
 
 def set_max_registers(n: int, *, action: Literal["increase", "decrease"]):
-  """Sets the maximum number of registers owned by a warp."""
+  """Sets the maximum number of per-lane registers in the thread."""
   set_max_registers_p.bind(n, action=action)
 
 
@@ -2911,6 +2914,68 @@ class ShapeDtypeStruct:
   shape: tuple[int, ...]
   dtype: jnp.dtype
   layout: SomeLayout
+
+
+griddepcontrol_wait_p = jax_core.Primitive("griddepcontrol_wait")
+griddepcontrol_wait_p.multiple_results = True
+
+
+@griddepcontrol_wait_p.def_effectful_abstract_eval
+def _griddepcontrol_wait_abstract_eval():
+  return (), {gpu_core._memory_effect}
+
+
+@lowering.register_lowering_rule(
+    griddepcontrol_wait_p, mgpu.LoweringSemantics.Lane
+)
+@lowering.register_lowering_rule(
+    griddepcontrol_wait_p, mgpu.LoweringSemantics.Warpgroup
+)
+def _griddepcontrol_wait_lowering(ctx: lowering.LoweringRuleContext):
+  void = ir.Type.parse("!llvm.void")
+  with lowering._wrap_in_custom_primitive_if_wg(ctx, []):
+    llvm_dialect.inline_asm(
+        void, [], "griddepcontrol.wait;", "", has_side_effects=True
+    )
+  return ()
+
+
+def griddepcontrol_wait():
+  """Wait for dependent grids to finish."""
+  griddepcontrol_wait_p.bind()
+
+
+griddepcontrol_launch_dependents_p = jax_core.Primitive(
+    "griddepcontrol_launch_dependents"
+)
+griddepcontrol_launch_dependents_p.multiple_results = True
+
+
+@griddepcontrol_launch_dependents_p.def_effectful_abstract_eval
+def _griddepcontrol_launch_dependents_abstract_eval():
+  return (), {gpu_core._memory_effect}
+
+
+@lowering.register_lowering_rule(
+    griddepcontrol_launch_dependents_p, mgpu.LoweringSemantics.Lane
+)
+@lowering.register_lowering_rule(
+    griddepcontrol_launch_dependents_p, mgpu.LoweringSemantics.Warpgroup
+)
+def _griddepcontrol_launch_dependents_lowering(
+    ctx: lowering.LoweringRuleContext,
+):
+  void = ir.Type.parse("!llvm.void")
+  with lowering._wrap_in_custom_primitive_if_wg(ctx, []):
+    llvm_dialect.inline_asm(
+        void, [], "griddepcontrol.launch_dependents;", "", has_side_effects=True
+    )
+  return ()
+
+
+def griddepcontrol_launch_dependents():
+  """Signal that dependents can be launched."""
+  griddepcontrol_launch_dependents_p.bind()
 
 
 inline_mgpu_p = jax_core.Primitive("inline_mgpu_p")
@@ -3292,11 +3357,7 @@ def _populate_custom_primitive_op_block(
           fn_inputs.append(arg)
           continue
 
-        _, transforms = (
-            mgpu.dialect_lowering.swizzle_and_transforms_from_transforms_attr(
-                ir.ArrayAttr(next(in_transforms_it))
-            )
-        )
+        transforms = ir.ArrayAttr(next(in_transforms_it))
         # The block arguments in the Mosaic GPU dialect are logical refs that
         # wrap the transfromed refs. Since the mgpu_fn works at the lowered
         # "lane" level, we need to transform (lower) the inputs before passing
@@ -3676,11 +3737,28 @@ def _async_store_tmem_lowering_rule(
   x_tmem, _, transforms = lowering._handle_transforms(
       ctx, x_aval, x_ref, transform_avals, transforms, handle_transposes=False,
       handle_reshapes=False)
+  batch_shape = ()
+  if transforms and isinstance(
+      transforms[0], gpu_core.ExpandLeadingBatchDimensionsTransform
+  ):
+    batch_shape = transforms[0].batch_shape
+    transforms = transforms[1:]
   if transforms:
     raise NotImplementedError(
         f"Unimplemented transforms for TMEM refs. {transforms=}"
     )
-  x_tmem.store(value)
+  if batch_shape:
+    m, n = value.shape[-2:]
+    for batch_idx in np.ndindex(batch_shape):
+      flat_batch_idx = int(np.ravel_multi_index(batch_idx, batch_shape))
+      # TODO(allanrenucci): Add direct support for indexing to FragmentedArray.
+      slices = tuple(slice(i, i + 1) for i in batch_idx)
+      val_slice = value[slices].reshape((m, n))
+      col_start = flat_batch_idx * n
+      tmem_slice = x_tmem.slice(slice(0, m), slice(col_start, col_start + n))
+      tmem_slice.store(val_slice)
+  else:
+    x_tmem.store(value)
   return ()
 
 
@@ -3714,11 +3792,30 @@ def _async_store_tmem_lowering_rule_wg(
       handle_transposes=False,
       handle_reshapes=False,
   )
+  batch_shape = ()
+  if transforms and isinstance(
+      transforms[0], gpu_core.ExpandLeadingBatchDimensionsTransform
+  ):
+    batch_shape = transforms[0].batch_shape
+    transforms = transforms[1:]
   if transforms:
     raise NotImplementedError(
         f"Unimplemented transforms for TMEM refs. {transforms=}"
     )
-  mgpu.dialect.async_store_tmem(value, x_tmem)
+  if batch_shape:
+    m, n = ir.VectorType(value.type).shape[-2:]
+    for batch_idx in np.ndindex(batch_shape):
+      flat_batch_idx = int(np.ravel_multi_index(batch_idx, batch_shape))
+      val_slice = vector_dialect.extract(
+          value, dynamic_position=[], static_position=batch_idx
+      )
+      col_start = flat_batch_idx * n
+      tmem_slice = mgpu_utils.memref_slice(
+          x_tmem, (slice(0, m), slice(col_start, col_start + n))
+      )
+      mgpu.dialect.async_store_tmem(val_slice, tmem_slice)
+  else:
+    mgpu.dialect.async_store_tmem(value, x_tmem)
   return ()
 
 
@@ -3889,6 +3986,9 @@ def _async_copy_sparse_metadata_to_tmem_lowering_rule(*args, **kwargs):
 
 @lowering.register_lowering_rule(
     async_copy_sparse_metadata_to_tmem_p, mgpu.LoweringSemantics.Warpgroup
+)
+@lowering.register_lowering_rule(
+    async_copy_sparse_metadata_to_tmem_p, *gpu_core.WGxWARP_SEMANTICS
 )
 def _async_copy_sparse_metadata_to_tmem_lowering_rule_wg(*args, **kwargs):
   return _async_copy_to_tmem_lowering_rule(
@@ -5040,9 +5140,8 @@ def _semaphore_signal_multicast_lowering(
       else:
         mgpu_utils.warpgroup_barrier()
 
-    predicate = None
-    if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
-      predicate = ctx.module_ctx.single_lane_predicate
+    assert ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane
+    predicate = ctx.module_ctx.single_lane_predicate
 
     mgpu_utils.SemaphoreRef.signal_multimem(
         mgpu_utils.memref_ptr(multi_ref), val, predicate=predicate

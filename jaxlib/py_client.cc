@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <Python.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -259,7 +260,7 @@ absl::Status PyClient::Defragment() {
           pjrt_buf_to_tmp_buffer.insert({pjrt_buf_ptr.get(), TmpBuffer()});
       if (inserted) {
         TF_ASSIGN_OR_RETURN(iter->second.host_copy,
-                            pjrt_buf_ptr->ToLiteralSync());
+                            pjrt_buf_ptr->ToLiteral().Await());
       }
       iter->second.pjrt_buffer_ptrs.push_back(&pjrt_buf_ptr);
     }
@@ -989,7 +990,14 @@ PyType_Slot PyClient::slots_[] = {
           },
           nb::arg("serialized"), nb::arg("executable_devices"),
           nb::arg("compile_options").none() = nb::none(),
-          nb::arg("host_callbacks") = std::vector<nb::capsule>())
+          nb::arg("host_callbacks") = std::vector<nb::capsule>(),
+          "Deserializes an executable.\n\n"
+          ".. warning::\n"
+          "   It is not safe to call this API with untrusted inputs. Do not\n"
+          "   do this. Calling this API loads a serialized executable. Even\n"
+          "   loading such an executable may run arbitrary code on your\n"
+          "   machine. It is not safe to pass untrusted data here and\n"
+          "   likely never will be.")
       .def(
           "deserialize_executable",
           [](nb_class_ptr<PyClient> client, nb::bytes serialized,
@@ -1005,7 +1013,14 @@ PyType_Slot PyClient::slots_[] = {
           },
           nb::arg("serialized"), nb::arg("executable_devices"),
           nb::arg("compile_options").none() = nb::none(),
-          nb::arg("host_callbacks") = std::vector<nb::callable>())
+          nb::arg("host_callbacks") = std::vector<nb::callable>(),
+          "Deserializes an executable.\n\n"
+          ".. warning::\n"
+          "   It is not safe to call this API with untrusted inputs. Do not\n"
+          "   do this. Calling this API loads a serialized executable. Even\n"
+          "   loading such an executable may run arbitrary code on your\n"
+          "   machine. It is not safe to pass untrusted data here and\n"
+          "   likely never will be.")
       // The following overload is for users of deprecated APIs who call
       // `deserialize_executable` but do not have visibility to `DeviceList`.
       .def(
@@ -1022,11 +1037,32 @@ PyType_Slot PyClient::slots_[] = {
                 std::vector<nb::capsule>()));
           },
           nb::arg("serialized"), nb::arg("executable_devices"),
-          nb::arg("compile_options").none() = nb::none())
+          nb::arg("compile_options").none() = nb::none(),
+          "Deserializes an executable.\n\n"
+          ".. warning::\n"
+          "   It is not safe to call this API with untrusted inputs. Do not\n"
+          "   do this. Calling this API loads a serialized executable. Even\n"
+          "   loading such an executable may run arbitrary code on your\n"
+          "   machine. It is not safe to pass untrusted data here and\n"
+          "   likely never will be.")
       .def("heap_profile", xla::ValueOrThrowWrapper(&PyClient::HeapProfile))
       // TODO(zhangqiaorjc): Experimental.
       .def("defragment",
            [](PyClient& self) { xla::ThrowIfError(self.Defragment()); })
+      .def(
+          "dma_map",
+          [](PyClient& self, std::uintptr_t address, size_t size) {
+            xla::ThrowIfError(self.pjrt_client()->DmaMap(
+                reinterpret_cast<void*>(address), size));
+          },
+          nb::arg("address"), nb::arg("size"))
+      .def(
+          "dma_unmap",
+          [](PyClient& self, std::uintptr_t address) {
+            xla::ThrowIfError(
+                self.pjrt_client()->DmaUnmap(reinterpret_cast<void*>(address)));
+          },
+          nb::arg("address"))
       .def("make_python_callback_from_host_send_and_recv",
            xla::ValueOrThrowWrapper(
                &PyClient::MakePythonCallbackUsingHostSendAndRecv),

@@ -41,10 +41,12 @@ from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
+from jax._src.interpreters import remat
 from jax._src.lax import lax
 from jax._src.traceback_util import api_boundary
 from jax._src.typing import ArrayLike
-from jax._src.util import safe_map, safe_zip, split_list, partition_list, unzip2
+from jax._src.util import (safe_map, safe_zip, split_list, partition_list,
+                           unzip2, split_list_checked)
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo
 import numpy as np
@@ -163,12 +165,15 @@ def _switch_internal(
   keep = [f is None for f in in_fwd]
   jaxprs = [pe.prune_closed_jaxpr_outputs(jaxpr, keep) for jaxpr in jaxprs]
 
-  joined_effects = core.join_effects(*(jaxpr.effects for jaxpr in jaxprs))
+  joined_effects = core.join_effects(
+      *(core.positional_effects(jaxpr) for jaxpr in jaxprs))
   disallowed_effects = effects.control_flow_allowed_effects.filter_not_in(joined_effects)
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `switch`: {disallowed_effects}')
-  jaxprs = [replace_jaxpr_effects(jaxpr, joined_effects) for jaxpr in jaxprs]
+  jaxprs = [replace_jaxpr_effects(
+      jaxpr, core.resolve_input_effects(joined_effects, jaxpr.jaxpr.invars))
+      for jaxpr in jaxprs]
   params = dict(branches=tuple(jaxprs))
   if branches_platforms is not None:
     params["branches_platforms"] = branches_platforms
@@ -302,15 +307,20 @@ def cond(pred, true_fun: Callable, false_fun: Callable, *operands,
   true_jaxpr = pe.prune_closed_jaxpr_outputs(true_jaxpr, keep)
   false_jaxpr = pe.prune_closed_jaxpr_outputs(false_jaxpr, keep)
 
-  joined_effects = core.join_effects(true_jaxpr.effects, false_jaxpr.effects)
+  joined_effects = core.join_effects(core.positional_effects(true_jaxpr),
+                                     core.positional_effects(false_jaxpr))
   disallowed_effects = effects.control_flow_allowed_effects.filter_not_in(joined_effects)
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `cond`: {disallowed_effects}')
 
   index = lax.convert_element_type(pred, np.int32)
-  false_jaxpr = replace_jaxpr_effects(false_jaxpr, joined_effects)
-  true_jaxpr = replace_jaxpr_effects(true_jaxpr, joined_effects)
+  false_jaxpr = replace_jaxpr_effects(
+      false_jaxpr,
+      core.resolve_input_effects(joined_effects, false_jaxpr.jaxpr.invars))
+  true_jaxpr = replace_jaxpr_effects(
+      true_jaxpr,
+      core.resolve_input_effects(joined_effects, true_jaxpr.jaxpr.invars))
 
   out = cond_p.bind(index, *consts, *args, branches=(false_jaxpr, true_jaxpr))
   out_ = iter(out)
@@ -412,10 +422,10 @@ def _capitalize(s):
 def _join_cond_effects(branches: Sequence[core.ClosedJaxpr]) -> effects.Effects:
   joined_effects = set()
   for b in branches:
-    for eff in b.effects:
+    for eff in core.positional_effects(b):
       if isinstance(eff, effects.JaxprInputEffect):
         # Offset index to handle predicate
-        eff = eff.replace(input_index=eff.input_index + 1)
+        eff = eff.replace(eff.input + 1)
       joined_effects.add(eff)
   return joined_effects
 
@@ -463,13 +473,13 @@ def _cond_batching_rule(axis_data, args, dims, *, branches, **params):
     raise NotImplementedError(
         "IO effect not supported in vmap-of-cond.")
 
-  if "branches_platforms" in params and (index_dim is not batching.not_mapped):
+  if "branches_platforms" in params and (index_dim is not None):
     # If we end up with a mapped index for a platform_dependent cond, we can
     # replace the index with a fresh call to platform_index. See #29329.
     index = platform_index_p.bind(platforms=params["branches_platforms"])
-    index_dim = batching.not_mapped
+    index_dim = None
 
-  if index_dim is not batching.not_mapped:
+  if index_dim is not None:
     # Convert to a lax.select. While we could get away with not broadcasting
     # some operands yet, because all outputs must be broadcast together anyway
     # for the select we broadcast the input operands for simplicity and leave
@@ -498,7 +508,7 @@ def _cond_batching_rule(axis_data, args, dims, *, branches, **params):
     out = [_bcast_select_n(index, *outs) for outs in zip(*branch_outs)]
     return out, [0 if b else None for b in out_batched]
   else:
-    ops_bat = [d is not batching.not_mapped for d in op_dims]
+    ops_bat = [d is not None for d in op_dims]
     ops = [batching.moveaxis(x, d, 0) if b else x
            for b, x, d in zip(ops_bat, ops, op_dims)]
 
@@ -510,7 +520,7 @@ def _cond_batching_rule(axis_data, args, dims, *, branches, **params):
         batching.batch_jaxpr(jaxpr, axis_data, ops_bat, out_bat)[0]
         for jaxpr in branches)
 
-    out_dims = [0 if b else batching.not_mapped for b in out_bat]
+    out_dims = [0 if b else None for b in out_bat]
     out = cond_p.bind(index, *ops, branches=branches_batched,
                       **params)
     return out, out_dims
@@ -636,7 +646,7 @@ def _cond_partial_eval(trace, *tracers, branches, **params):
   source = source_info_util.current().replace(name_stack=name_stack)
   eqn = pe.new_eqn_recipe(
       trace, [index_tracer] + res_tracers + ops_tracers, out_tracers, cond_p, params,
-      core.join_effects(*(j.effects for j in branches_unknown)), source)
+      _join_cond_effects(branches_unknown), source)
   for t in out_tracers: t.recipe = eqn
   return util.merge_lists(out_uks, out_consts, out_tracers)
 
@@ -765,7 +775,7 @@ def _join_cond_outputs(jaxprs: Sequence[core.ClosedJaxpr],
     def f_aug(*args):
       outs_and_residuals = core.jaxpr_as_fun(jaxpr)(*args)
       outs, residuals = split_list(outs_and_residuals, [num_non_res_outputs])
-      aug_residuals = map(ad_util.zeros_like_aval, all_res_avals)
+      aug_residuals = map(ad_util.empty_like_aval, all_res_avals)
       aug_residuals = util.subvals(aug_residuals, zip(res_indices, residuals))
       return outs + list(aug_residuals)
 
@@ -924,6 +934,25 @@ def _cond_typecheck(bind_time, *in_atoms, branches, **params):
       f'called with operands of type {_avals_short(op_avals)}')
   return jaxpr0.out_avals, joined_effects
 
+def _cond_remat(policy, *args, branches, **params):
+  branches_fwd, branches_rem, branch_res_avals = [], [], []
+  for jaxpr in branches:
+    jaxpr_fwd, jaxpr_rem, num_res = remat.remat_jaxpr(jaxpr, policy)
+    branches_fwd.append(jaxpr_fwd)
+    branches_rem.append(jaxpr_rem)
+    _, res_avals = split_list_checked(jaxpr_fwd.out_avals, [len(jaxpr.out_avals), num_res])
+    branch_res_avals.append(res_avals)
+  merged_avals, branch_res_avals = _merge_branch_residuals(branch_res_avals)
+  branches_fwd = _join_cond_outputs(
+      branches_fwd, merged_avals, branch_res_avals, len(jaxpr.out_avals))
+  branches_rem = _join_cond_pe_staged_jaxpr_inputs(
+      branches_rem, merged_avals, branch_res_avals)
+  all_out = cond_p.bind(*args, branches=branches_fwd, **params)
+  primals_out, res = split_list(all_out, [len(jaxpr.out_avals)])
+  def rem(idx, *args):
+    return cond_p.bind(idx, *res, *args, branches=branches_rem, **params)
+  return primals_out, rem
+
 
 BranchesPlatforms = tuple[tuple[str, ...] | None, ...]
 # cond_p takes an optional branches_platforms param of type `BranchesPlatforms`
@@ -947,6 +976,7 @@ batching.fancy_primitive_batchers[cond_p] = _cond_batching_rule
 core.custom_typechecks[cond_p] = partial(_cond_typecheck, False)
 pe.partial_eval_jaxpr_custom_rules[cond_p] = _cond_partial_eval_custom
 pe.dce_rules[cond_p] = _cond_dce_rule
+remat.rules[cond_p] = _cond_remat
 
 def _cond_is_high(*_, branches, **__) -> bool:
   return any(j.jaxpr.is_high for j in branches)
@@ -1020,7 +1050,7 @@ def _cond_lowering(ctx, index, *args, branches, **params):
   output_token_types = [mlir.token_type() for _ in ordered_effects]
   output_types = [
       *output_token_types, *map(partial(mlir._aval_to_ir_types, ctx.module_context), ctx.avals_out)]
-  flat_output_types = mlir.flatten_ir_types(output_types)
+  flat_output_types, treedef = mlir.ir_tree_registry.flatten(output_types)
 
   # CaseOp takes a single argument 'index' and the corresponding blocks
   # have no arguments; the computation within the block uses implicit
@@ -1040,14 +1070,14 @@ def _cond_lowering(ctx, index, *args, branches, **params):
           outer_traceback=ctx.traceback)
       out_tokens = [tokens_out.get(eff) for eff in ordered_effects]
       out_vals = [*out_tokens, *out_vals]
-      hlo.return_(mlir.flatten_ir_values(out_vals))
+      flat_out_vals, _ = mlir.ir_tree_registry.flatten(out_vals)
+      hlo.return_(flat_out_vals)
 
-  tokens_and_outputs = mlir.unflatten_ir_values_like_types(
-    case_op.results, output_types)
+  tokens_and_outputs = treedef.unflatten(case_op.results)
   tokens, outputs = util.split_list(tokens_and_outputs, [num_tokens])
   outputs = [mlir.lower_with_sharding_in_types(ctx, o, aval)
              for o, aval in zip(outputs, ctx.avals_out)]
-  ctx.set_tokens_out(mlir.TokenSet(zip(ordered_effects, tokens)))
+  ctx.set_tokens_out(mlir.TokenSet(dict(zip(ordered_effects, tokens))))
   return outputs
 
 mlir.register_lowering(cond_p, _cond_lowering)
@@ -1056,9 +1086,10 @@ mlir.register_lowering(cond_p, _cond_lowering)
 def _cond_state_discharge_rule(should_discharge, in_avals, out_avals, index, *args,
                                branches, **params):
   assert not should_discharge[0], "Can't discharge the index."
-  discharged_branches, discharged_consts = unzip2(
-      discharge_state(branch.jaxpr, branch.consts, should_discharge=should_discharge[1:])
-      for branch in branches)
+  discharged_branches = tuple(
+      discharge_state(branch, should_discharge=should_discharge[1:])
+      for branch in branches
+  )
   # Don't thread the ref values through the cond if they never change.
   forwarded_outvars: list[int | None] | None = None
   for branch in discharged_branches:
@@ -1074,10 +1105,14 @@ def _cond_state_discharge_rule(should_discharge, in_avals, out_avals, index, *ar
           for i, j in zip(forwarded_outvars, branch_forwarding)]
   assert forwarded_outvars is not None
   all_outvars_fwd = [None] * len(out_avals) + forwarded_outvars
-  new_branches = tuple(core.ClosedJaxpr(
-          branch.replace(outvars=[v for v, fwd in zip(branch.outvars, all_outvars_fwd)
-                                  if fwd is None]), consts)
-      for branch, consts in zip(discharged_branches, discharged_consts))
+  new_branches = tuple(
+      branch.replace(
+          jaxpr=branch.jaxpr.replace(
+              outvars=[v for v, fwd in zip(branch.outvars, all_outvars_fwd) if fwd is None]
+          )
+      )
+      for branch in discharged_branches
+  )
   out_vals_no_fwd = cond_p.bind(index, *args, branches=new_branches,
                                 **params)
   out_vals, out_ref_vals_no_fwd = util.split_list(out_vals_no_fwd, [len(out_avals)])

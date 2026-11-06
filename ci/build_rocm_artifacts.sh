@@ -80,9 +80,9 @@ fi
 # has librocsolver.so.0. rules_ml_toolchain honors ROCM_PATH ahead of its
 # download path; rocm-sdk path --root is the pip-installed SDK root (no
 # /opt/rocm needed). Gated on rocm-sdk so apt-ROCm images keep the default.
-rocm_path_flags=""
+rocm_path_flags=()
 if command -v rocm-sdk >/dev/null 2>&1; then
-  rocm_path_flags="--bazel_options=--repo_env=ROCM_PATH=$(rocm-sdk path --root)"
+  rocm_path_flags=("--bazel_options=--repo_env=ROCM_PATH=$(rocm-sdk path --root)")
 fi
 
 echo "Building $artifact..."
@@ -99,7 +99,7 @@ python build/build.py build --wheels="$artifact" \
   $artifact_tag_flags \
   $override_xla_repo \
   $wheel_version_suffix_flag \
-  $rocm_path_flags
+  "${rocm_path_flags[@]}"
 
 # Verify manylinux compliance.
 ./ci/utilities/run_auditwheel.sh

@@ -29,10 +29,11 @@ from jax import typeof
 
 from jax._src import config
 from jax._src import core
-from jax._src import dtypes
 from jax._src import state
 from jax._src.state import indexing
 from jax._src.state import primitives as state_primitives
+from jax._src.custom_derivatives import custom_jvp_call_p
+from jax._src.custom_derivatives import custom_vjp_call_p
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src import test_util as jtu
@@ -569,8 +570,7 @@ class HijaxTest(jtu.JaxTestCase):
         return MyArray(jnp.zeros((), 'float32'))
       def vspace_add(self, x, y):
         return add(x, y)
-    core.pytype_aval_mappings[MyArray] = lambda _: MyTy()
-    dtypes.canonicalize_value_handlers[MyArray] = lambda x: x
+    register_hitype(MyArray, lambda _: MyTy())
 
     class ToMy(HiPrimitive):
       def is_high(self, _): return True
@@ -748,12 +748,23 @@ class HijaxTest(jtu.JaxTestCase):
 
   def test_tuple_vmap(self):
     tup = make_tup(jnp.arange(3.), jnp.arange(3.))
-    jax.vmap(lambda x: x, in_axes=TupSpec((0, 0)), out_axes=TupSpec((0, 0)), axis_size=3)(tup)
+    out = jax.vmap(lambda x: x, in_axes=TupSpec((0, 0)),
+                   out_axes=TupSpec((0, 0)), axis_size=3)(tup)
+    self.assertAllClose(out.elts, tup.elts)
 
   def test_tuple_vmap_infer(self):
     tup = make_tup(jnp.arange(3.), jnp.arange(3.))
     jax.vmap(lambda _: make_tup(jnp.ones(3), jnp.ones(3)),
              in_axes=TupSpec((0, 0)), out_axes=batching.infer, axis_size=3)(tup)
+
+  def test_tuple_nested_vmap(self):
+    tup = make_tup(jnp.arange(12.).reshape((3, 4)), jnp.arange(12.).reshape((3, 4)))
+    map1 = jax.vmap(lambda x: x, in_axes=TupSpec((0, 0)), out_axes=TupSpec((0, 0)),
+                    axis_size=3)
+    map2 = jax.vmap(map1, in_axes=TupSpec((1, 1)), out_axes=TupSpec((1, 1)),
+                    axis_size=4)
+    out = map2(tup)
+    self.assertAllClose(out.elts, tup.elts)
 
   # def test_tuple_vmap_match(self):
   #   tup = make_tup(jnp.arange(3.), jnp.arange(3.))
@@ -1361,19 +1372,17 @@ class HijaxTest(jtu.JaxTestCase):
 
     f(0, x_ref)
     self.assertAllClose(x_ref[...], 4., check_dtypes=False)
-    self.assertEqual(jax.jit(f).trace(0, x_ref).jaxpr.effects, {state.WriteEffect(1)})
+    traced_jaxpr = jax.jit(f).trace(0, x_ref).jaxpr
+    self.assertEqual(traced_jaxpr.effects,
+                     {state.WriteEffect(traced_jaxpr.jaxpr.invars[1])})
 
   def test_lower_preserves_arg_names_for_shaped_arrays(self):
-    """When all inputs/outputs are ShapedArray, arg_names should be preserved
-    even when the jaxpr is_high due to containing hi-primitives internally."""
     x = jnp.array(1.0)
     lowered = jax.jit(square).lower(x)
     debug_info = lowered._lowering.compile_args['all_args_info'].debug_info
     self.assertEqual(debug_info.arg_names, ('x',))
 
   def test_lower_replicates_arg_names_for_hitypes(self):
-    """When inputs are HiType, arg_names should be replicated to match
-    the expanded lo-args (e.g. QArrayTy expands to 2 lo-args)."""
     def f(x):
       return from_qarray(x)
 
@@ -1765,7 +1774,6 @@ class BoxTest(jtu.JaxTestCase):
 
     self.assertAllClose(f(1.0), 2.0)
 
-
   # TODO error-checking tests from attrs_test.py
 
   ###
@@ -1866,7 +1874,7 @@ class BoxTest(jtu.JaxTestCase):
 
       def __eq__(self, other): return isinstance(other, MyTy)
 
-    core.pytype_aval_mappings[MyArray] = lambda _: MyTy()
+    register_hitype(MyArray, lambda _: MyTy())
 
     box = Box([MyArray(jnp.float32(1)),
                MyArray(jnp.float32(2))])
@@ -2183,6 +2191,121 @@ class HijaxTransformCoverageTest(jtu.JaxTestCase):
     jax.lax.scan(body, None, None, length=5)
     self.assertAllClose(box.get(), 8.0, check_dtypes=False)
 
+  def test_grad_custom_vjp_optimize_remat_with_hijax(self):
+
+    @jax.custom_vjp
+    def f(x):
+      return square(x)
+
+    def f_fwd(x):
+      y = square(x)
+      return y, x  # (primal_out, residuals)
+
+    def f_bwd(res, g):
+      x = res
+      return (g * 2.0 * x,)
+
+    f.defvjp(f_fwd, f_bwd, optimize_remat=True)
+
+    x = jnp.float32(3.0)
+    result = jax.jit(jax.grad(f))(x)
+    self.assertAllClose(result, jnp.float32(6.0))
+
+  def test_custom_vjp_inlined_when_lower(self):
+
+    @jax.custom_vjp
+    def foo(x):
+      return square(x)
+    def foo_fwd(x):
+      return foo(x), x
+    def foo_bwd(res, g):
+      return (g * 2.0 * res,)
+    foo.defvjp(foo_fwd, foo_bwd)
+
+    jaxpr = jax.jit(foo).trace(jnp.float32(0.0)).lojax.jaxpr
+
+    has_custom_vjp = any(
+        eqn.primitive is custom_vjp_call_p for eqn in jaxpr.eqns)
+    self.assertFalse(has_custom_vjp,
+        "custom_vjp_call_p should be inlined when lower=True")
+
+  def test_custom_jvp_inlined_when_lower(self):
+
+    @jax.custom_jvp
+    def foo(x):
+      return square(x)
+    @foo.defjvp
+    def foo_jvp(primals, tangents):
+      x, = primals
+      t, = tangents
+      return square(x), t * 2.0 * x
+
+    jaxpr = jax.jit(foo).trace(jnp.float32(0.0)).lojax.jaxpr
+
+    has_custom_jvp = any(
+        eqn.primitive is custom_jvp_call_p for eqn in jaxpr.eqns)
+    self.assertFalse(has_custom_jvp,
+        "custom_jvp_call_p should be inlined when lower=True")
+
+  def test_custom_vjp_with_hiprimitive_is_high(self):
+    @jax.custom_vjp
+    def foo(x):
+      return square(x)
+    def foo_fwd(x):
+      y = foo(x)
+      return y, x
+    def foo_bwd(res, g):
+      return (g * 2.0 * res,)
+    foo.defvjp(foo_fwd, foo_bwd)
+
+    jaxpr = jax.make_jaxpr(foo)(jnp.float32(2.0))
+    # The call_jaxpr should contain hi-primitives (square)
+    self.assertTrue(jaxpr.jaxpr.is_high)
+
+  def test_custom_vjp_with_hiprimitive_lowered(self):
+
+    @jax.custom_vjp
+    def foo(x):
+      return square(x)
+    def foo_fwd(x):
+      y = foo(x)
+      return y, x
+    def foo_bwd(res, g):
+      return (g * 2.0 * res,)
+    foo.defvjp(foo_fwd, foo_bwd)
+
+    jaxpr = jax.jit(foo).trace(jnp.float32(0.0)).lojax.jaxpr
+
+    # custom_vjp_call_p should be inlined (no custom_vjp_call eqns remain)
+    has_custom_vjp = any(
+        eqn.primitive is custom_vjp_call_p for eqn in jaxpr.eqns)
+    self.assertFalse(has_custom_vjp,
+        "custom_vjp_call_p with hi-primitives should be inlined when "
+        "lower=True")
+    # The hi-primitive (square) should also be lowered
+    self.assertFalse(jaxpr.is_high,
+        "Lowered jaxpr should not contain hi-primitives")
+
+  def test_custom_jvp_with_hiprimitive_lowered(self):
+
+    @jax.custom_jvp
+    def foo(x):
+      return square(x)
+    @foo.defjvp
+    def foo_jvp(primals, tangents):
+      x, = primals
+      t, = tangents
+      return square(x), t * 2.0 * x
+
+    jaxpr = jax.jit(foo).trace(jnp.float32(0.0)).lojax.jaxpr
+
+    has_custom_jvp = any(
+        eqn.primitive is custom_jvp_call_p for eqn in jaxpr.eqns)
+    self.assertFalse(has_custom_jvp,
+        "custom_jvp_call_p with hi-primitives should be inlined when "
+        "lower=True")
+    self.assertFalse(jaxpr.is_high,
+        "Lowered jaxpr should not contain hi-primitives")
 
 class LogTest(jtu.JaxTestCase):
 

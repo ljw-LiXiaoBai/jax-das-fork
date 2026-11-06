@@ -19,7 +19,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import operator
-from typing import cast, Any, ClassVar, Union
+from typing import cast, Any, ClassVar
 
 from jax._src import core
 from jax._src import pretty_printer as pp
@@ -58,8 +58,8 @@ def _pp_slice(context: core.JaxprPpContext, dim, slc: Slice) -> pp.Doc:
       end_str = "" if end == dim else str(end)
       return pp.text(f"{start_str}:{end_str}")
 
-IntIndexer = Union[int, Array, Any]
-DimIndexer = Union[IntIndexer, Slice]
+IntIndexer = int | Array | Any
+DimIndexer = IntIndexer | Slice
 
 def unpack_ndindexer(indexer: NDIndexer) -> tuple[tuple[bool, ...],
                                                   tuple[Slice, ...],
@@ -81,7 +81,7 @@ def _maybe_concretize(x: Any):
 indexer_transform_type_registry: set[type] = set()
 
 @tree_util.register_pytree_node_class
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class NDIndexer(state_types.Transform):
   indices: tuple[DimIndexer, ...]
   shape: tuple[int, ...]

@@ -17,7 +17,6 @@ import gzip
 import json
 import os
 import re
-import unittest
 
 from absl.testing import absltest
 
@@ -27,8 +26,7 @@ from jax import lax
 from jax._src import config
 from jax._src import jaxpr_util
 from jax._src import test_util as jtu
-from jax._src.lib import jaxlib_extension_version
-from jax._src.lib import xla_client
+from jax._src.lib import _jax
 
 
 config.parse_flags_with_absl()
@@ -108,10 +106,10 @@ class JaxprStatsTest(jtu.JaxTestCase):
       return jnp.sin(s) + jnp.cos(y)
     profile_gz = jaxpr_util.pprof_equation_profile(make_jaxpr(f)(1., 1.).jaxpr)
     profile_proto = gzip.decompress(profile_gz)
-    json_str = xla_client._xla.pprof_profile_to_json(profile_proto)
+    json_str = _jax.pprof_profile_to_json(profile_proto)
     profile = json.loads(json_str)
     self.assertSetEqual(
-        {"sampleType", "sample", "stringTable", "location", "function"},
+        {'sampleType', 'sample', 'stringTable', 'location', 'function', 'comment'},
         set(profile.keys()))
 
   def test_all_eqns_with_traceback(self):
@@ -164,7 +162,6 @@ class JaxprStatsTest(jtu.JaxTestCase):
     # (should be > 1 due to the condition and branch eqns)
     self.assertEqual(jaxpr_util.count_eqns(jaxpr_nested), 5)
 
-  @unittest.skipIf(jaxlib_extension_version < 450, "Requires jaxlib >= 450")
   def test_jaxpr_to_html(self):
     def f(x):
       return x + 2

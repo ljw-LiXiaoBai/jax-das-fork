@@ -543,6 +543,99 @@ class DialectTest(MosaicGpuTest):
     ):
       self.module.operation.verify()
 
+  def test_mma_types_match(self):
+    with ir.InsertionPoint(self.module.body):
+      acc, a, b = undefs(
+          ir.VectorType.get([64, 8], ir.F32Type.get()),
+          ir.VectorType.get([64, 16], ir.F16Type.get()),
+          ir.VectorType.get([16, 8], ir.BF16Type.get()),
+      )
+      mgpu.dialect.mma(acc, a, b)
+
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        "The `a` and `b` inputs must have the same element type.",
+    ):
+      self.module.operation.verify()
+
+  def test_mma_acc_m_not_equal_to_a_m_dim(self):
+    with ir.InsertionPoint(self.module.body):
+      acc, a, b = undefs(
+          ir.VectorType.get([32, 8], ir.F32Type.get()),
+          ir.VectorType.get([64, 16], ir.F16Type.get()),
+          ir.VectorType.get([16, 8], ir.F16Type.get()),
+      )
+      mgpu.dialect.mma(acc, a, b)
+
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        "The accumulator's first dimension 32 must be equal to the first dimension of `a`: 64.",
+    ):
+      self.module.operation.verify()
+
+  def test_mma_acc_n_not_equal_to_b_n_dim(self):
+    with ir.InsertionPoint(self.module.body):
+      acc, a, b = undefs(
+          ir.VectorType.get([64, 16], ir.F32Type.get()),
+          ir.VectorType.get([64, 16], ir.F16Type.get()),
+          ir.VectorType.get([16, 8], ir.F16Type.get()),
+      )
+      mgpu.dialect.mma(acc, a, b)
+
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        "The accumulator's second dimension 16 must be equal to the second"
+        " dimension of `b`: 8.",
+    ):
+      self.module.operation.verify()
+
+  def test_mma_a_k_dim_not_equal_to_b_k_dim(self):
+    with ir.InsertionPoint(self.module.body):
+      acc, a, b = undefs(
+          ir.VectorType.get([64, 8], ir.F32Type.get()),
+          ir.VectorType.get([64, 16], ir.F16Type.get()),
+          ir.VectorType.get([32, 8], ir.F16Type.get()),
+      )
+      mgpu.dialect.mma(acc, a, b)
+
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        "`a`'s second dimension 16 must be equal to `b`'s first dimension: 32.",
+    ):
+      self.module.operation.verify()
+
+  def test_mma_int_operands_acc_not_i32(self):
+    with ir.InsertionPoint(self.module.body):
+      i8 = ir.IntegerType.get_signless(8)
+      acc, a, b = undefs(
+          ir.VectorType.get([64, 8], ir.F32Type.get()),
+          ir.VectorType.get([64, 32], i8),
+          ir.VectorType.get([32, 8], i8),
+      )
+      mgpu.dialect.mma(acc, a, b)
+
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        r"Only i32 accumulator supported for integer operands\.",
+    ):
+      self.module.operation.verify()
+
+  def test_mma_float_operands_acc_not_f32(self):
+    with ir.InsertionPoint(self.module.body):
+      i32 = ir.IntegerType.get_signless(32)
+      acc, a, b = undefs(
+          ir.VectorType.get([64, 8], i32),
+          ir.VectorType.get([64, 16], ir.F16Type.get()),
+          ir.VectorType.get([16, 8], ir.F16Type.get()),
+      )
+      mgpu.dialect.mma(acc, a, b)
+
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        "Only float accumulator supported for floating operands.",
+    ):
+      self.module.operation.verify()
+
   def test_wgmma_types_match(self):
     with ir.InsertionPoint(self.module.body):
       acc, a, b = undefs(
@@ -2377,6 +2470,32 @@ class DialectLoweringTest(MosaicGpuTest):
           smem_scratch_shape=jax.ShapeDtypeStruct((), jnp.int32),
           thread_semantics=mgpu.LoweringSemantics.Warpgroup,
       )
+
+  def test_transformed_strided_load_raises(self):
+    shape = (128, 128)
+    dtype = ir.BF16Type.get()
+
+    with ir.InsertionPoint(self.module.body):
+      ty_logical = ir.MemRefType.get(shape, dtype, memory_space=mgpu_utils.smem())
+      smem = mgpu.dialect.slice_smem(ty_logical, 0)
+      transforms_attr = ir.ArrayAttr.get([
+          ir.ArrayAttr.get([
+              mgpu.dialect.TileTransformAttr.get((64, 64)),
+              mgpu.dialect.SwizzleTransformAttr.get(128),
+          ])
+      ])
+      smem.owner.attributes["out_transforms"] = transforms_attr
+      load = mgpu.dialect.vector_load(smem)
+      strided_layout = mgpu.WGStridedFragLayout.from_shaped_type(load.type)
+      load.owner.attributes["out_layouts"] = ir.ArrayAttr.get([
+          layouts.to_layout_attr(strided_layout)
+      ])
+      load.owner.attributes["in_transforms"] = transforms_attr
+
+    with self.assertRaisesRegex(
+        NotImplementedError, "Transformed or swizzled strided loads are not supported"
+    ):
+      mgpu.lower_mgpu_dialect(self.module, None)
 
   def test_transform_type_handles_type_with_untiled_dimensions_correctly(self):
     ty = ir.MemRefType.get(

@@ -35,6 +35,7 @@ limitations under the License.
 #include <vector>
 
 #include "jaxlib/mosaic/gpu/library_paths.h"
+#include "absl/algorithm/container.h"
 #include "absl/base/call_once.h"
 #include "absl/base/no_destructor.h"
 #include "absl/base/nullability.h"
@@ -252,10 +253,7 @@ mlir::FailureOr<mlir::OpPassManager> GetPassPipeline(
     mlir::arith::registerArithExpandOpsPass();
     mlir::LLVM::registerDIScopeForLLVMFuncOpPass();
   });
-  const char* cuda_root = mosaic::gpu::GetCUDARoot();
-  if (!cuda_root) {
-    return mlir::failure();
-  }
+
   std::vector<std::string> libraries_to_link{
       ::xla::gpu::nvptx::LibDevicePath(mosaic::gpu::kDefaultCudaDataDir)};
   if (!nvshmem_path.empty()) {
@@ -288,8 +286,8 @@ mlir::FailureOr<mlir::OpPassManager> GetPassPipeline(
           mosaic-convert-gpu-to-llvm,
           gpu.module(reconcile-unrealized-casts),
           ensure-debug-info-scope-on-llvm-func{emission-kind=DebugDirectivesOnly},
-          mosaic-gpu-module-to-assembly{libraries-to-link=%3$s},
           convert-math-to-llvm{approximate-log1p=true},
+          mosaic-gpu-module-to-assembly{libraries-to-link=%3$s},
           canonicalize{max-iterations=10 max-num-rewrites=-1 region-simplify=normal test-convergence=false top-down=true},
           cse,
           mosaic-gpu-assembly-to-binary,
@@ -1108,6 +1106,42 @@ absl::StatusOr<std::vector<int64_t>> GetReplicaIds(
   return ParseInts(replica_ids_str);
 }
 
+// Returns the vector of booleans indicating whether the corresponding buffer
+// is used with multimem instruction or across several processes.
+absl::StatusOr<std::vector<bool>> ParseCollectiveMemoryParameters(
+    xla::ffi::Dictionary attributes, size_t num_buffers) {
+  std::string_view attribute_value =
+      attributes.get<std::string_view>("multimem_parameters").value_or("");
+  if (attribute_value.empty()) {
+    return std::vector<bool>(num_buffers, false);
+  }
+  TF_ASSIGN_OR_RETURN(std::vector<int64_t> collective_memory_parameters,
+                      ParseInts(attribute_value));
+  if (collective_memory_parameters.size() != num_buffers) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Multimem arguments list size %d is not equal to number "
+        "of buffers %d",
+        collective_memory_parameters.size(), num_buffers));
+  }
+  std::vector<bool> result(num_buffers);
+  for (int64_t arg = 0; arg < num_buffers; ++arg) {
+    const int collective_memory = collective_memory_parameters[arg];
+    switch (collective_memory) {
+      case 0:
+        result[arg] = false;
+        break;
+      case 1:
+        result[arg] = true;
+        break;
+      default:
+        return absl::InvalidArgumentError(
+            absl::StrFormat("Invalid collective memory parameter: %d",
+                            collective_memory));
+    }
+  }
+  return result;
+}
+
 absl::StatusOr<xla::gpu::GpuCliqueKey> GetCliqueKey(
     const xla::gpu::CollectiveParams& collective_params,
     const xla::ffi::Dictionary& attributes) {
@@ -1285,11 +1319,12 @@ absl::Status MosaicGpuPrepare(
       std::vector<std::vector<xla::GlobalDeviceId>> device_groups,
       GetCliqueDeviceGroups(*collective_params, attributes));
   TF_RETURN_IF_ERROR(clique_requests->RequestClique(clique_key, device_groups));
+  TF_ASSIGN_OR_RETURN(
+      std::vector<bool> collective_parameters,
+      ParseCollectiveMemoryParameters(attributes, buffers.size()));
   for (int i = 0; i < buffers.size(); ++i) {
-    se::DeviceAddressBase device_address = buffers[i].device_memory();
-
-    if (collective_params->executor->IsVmmMemory(device_address)) {
-      TF_RETURN_IF_ERROR(collective_memory_requests->RequestMulticastAddress(
+    if (collective_parameters[i]) {
+      TF_RETURN_IF_ERROR(collective_memory_requests->RequestSymmetricAddress(
           clique_key, buffers[i].device_memory()));
     }
   }
@@ -1338,13 +1373,29 @@ absl::Status MosaicGpuInitialize(
   TF_ASSIGN_OR_RETURN(xla::gpu::GpuCliqueKey clique_key,
                       GetCliqueKey(*collective_params, attributes));
 
+  std::vector<void*> param_to_peers(buffers.size() * clique_key.num_devices());
+  TF_ASSIGN_OR_RETURN(
+      std::vector<bool> collective_memory_parameters,
+      ParseCollectiveMemoryParameters(attributes, buffers.size()));
+
+  const bool all_parameters_in_collective_memory = absl::c_all_of(
+      collective_memory_parameters,
+      [](bool is_collective_memory) { return is_collective_memory; });
+  if (!all_parameters_in_collective_memory && !clique_key.is_local()) {
+    return absl::InvalidArgumentError(
+        "Non-local cliques are only supported when all parameters are allocated"
+        " within the collective memory.");
+  }
+
+  xla::RankId rank =
+      clique_key.rank(collective_params->global_device_id).value();
   for (int i = 0; i < buffers.size(); ++i) {
     XLA_VLOG_DEVICE(6, device_ordinal)
         << "MosaicGpuInitialize processing buffer: " << i;
     se::DeviceAddressBase device_address = buffers[i].device_memory();
     collective_metadata_parameters[i] = device_address;
 
-    if (collective_params->executor->IsVmmMemory(device_address)) {
+    if (collective_memory_parameters[i]) {
       // The physical memory range contains several allocations
       // (for example we have separate allocations for the HLO module parameters
       // and temporary buffers). Each allocation can contain several HLO buffers
@@ -1354,37 +1405,76 @@ absl::Status MosaicGpuInitialize(
       // mapping the allocation range to multimem address space we also need to
       // substract the offset from the parameter base address to exchange the
       // addresses of allocation in which the parameter is located.
-      auto [multimem_address, offset] =
-          collective_memory->FindMultimemAddress(clique_key, device_address);
+      auto [symmetric_memory, offset] =
+          collective_memory->FindSymmetricMemory(clique_key, device_address);
 
+      TF_ASSIGN_OR_RETURN(se::DeviceAddressBase multimem_address,
+                          symmetric_memory->multimem_addr());
 
       XLA_VLOG_DEVICE(6, device_ordinal)
-              << "MosaicGpuInitialize buffer: " << i << " device_address: ("
-              << device_address.opaque() << ", size: " << device_address.size()
-              << ") found multimem_address: (" << multimem_address
-              << ", offset: " << offset << ")"
-              << " for device_address: (" << device_address.opaque()
-              << ", size: " << device_address.size() << ")";
+          << "MosaicGpuInitialize buffer: " << i << " device_address: ("
+          << device_address.opaque() << ", size: " << device_address.size()
+          << ") found multimem_address: (" << multimem_address.opaque()
+          << ", offset: " << offset << ")";
 
-      parameter_multimem_addresses[i] = multimem_address;
-      // Use the allocated memory allocation instead to correctly calculate the
-      // offset of the multimem parameter.
-      collective_metadata_parameters[i] =
-          se::DeviceAddressBase(SubtractOffset(device_address.opaque(), offset),
-                                device_address.size() + offset);
+      parameter_multimem_addresses[i] = multimem_address.opaque();
+
+      // When all parameters are allocated with VMM API we can use NCCL API
+      // to get peer addresses instead of using a host rendezvous.
+      if (all_parameters_in_collective_memory) {
+        // Use the allocated memory allocation instead to correctly calculate
+        // the offset of the multimem parameter.
+        const size_t parameter_offset = i * clique_key.num_devices();
+        for (int device_rank = 0; device_rank < clique_key.num_devices();
+             ++device_rank) {
+          if (device_rank == rank.value()) {
+            param_to_peers[parameter_offset + device_rank] =
+                se::DeviceAddressBase(
+                    SubtractOffset(device_address.opaque(), offset),
+                    device_address.size() + offset)
+                    .opaque();
+          } else {
+            // Peer address returns the address of XLA allocation on a peer
+            // device This address corresponds to the multimem address space.
+            TF_ASSIGN_OR_RETURN(
+                se::DeviceAddressBase peer_address,
+                symmetric_memory->peer_addr(xla::RankId(device_rank)));
+            param_to_peers[parameter_offset + device_rank] =
+                peer_address.opaque();
+          }
+        }
+      } else {
+        // When only part of the parameters are allocated with VMM API we need
+        // to use a host rendezvous to exchange the parameter addresses.
+        // In order to correctly calculate the offset of address on multimem
+        // address space at device we need to exchange the address of the XLA
+        // allocation and not an address of parameter itself. Since the
+        // FindSymmetricMemory returns an offset from allocation to the
+        // parameter, we need to subtract this offset here.
+        collective_metadata_parameters[i] = se::DeviceAddressBase(
+            SubtractOffset(device_address.opaque(), offset),
+            device_address.size() + offset);
+      }
     }
   }
 
-  xla::RankId rank =
-      clique_key.rank(collective_params->global_device_id).value();
   DeviceState& device_state = GetDeviceState(resources, collective_params);
   TF_RETURN_IF_ERROR(InitializeBarrier(device_state, stream, collective_params,
                                        collective_cliques, clique_key, rank));
 
-  TF_ASSIGN_OR_RETURN(
-      std::vector<void*> param_to_peers,
-      xla::gpu::CollectParamToPeers(clique_key, rank, stream,
-                                    std::move(collective_metadata_parameters)));
+  // If all parameters are allocated with VMM API, we can use NCCL to get peer
+  // addresses. Otherwise, we need to use a rendezvous on the host to exchange
+  // the parameter addresses. In a multi-host setting all parameters should be
+  // allocated with VMM API at the XLA side.
+  if (!all_parameters_in_collective_memory) {
+    XLA_VLOG_DEVICE(6, device_ordinal)
+        << "Param_to_peers before rendezvous: ("
+        << absl::StrJoin(param_to_peers, ", ", PtrFormatter{}) << ")";
+    TF_ASSIGN_OR_RETURN(param_to_peers,
+                        xla::gpu::CollectParamToPeers(
+                            clique_key, rank, stream,
+                            std::move(collective_metadata_parameters)));
+  }
 
   // Construct the collective kernel metadata information.
   CollectiveKernelMetadata metadata;
@@ -1425,7 +1515,7 @@ absl::Status MosaicGpuInitialize(
                                     device_state.metadata_bytes.size()));
 
   XLA_VLOG_DEVICE(5, device_ordinal)
-      << "[" << rank << "] Constructed device state {"
+      << "Constructed device state {"
       << " metadata rank: " << metadata.rank << ", param_to_peers: ("
       << absl::StrJoin(param_to_peers, ", ", PtrFormatter{})
       << "), multimem address spaces: ("

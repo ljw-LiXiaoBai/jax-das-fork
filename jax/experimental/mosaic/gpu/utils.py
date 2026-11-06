@@ -20,6 +20,7 @@ import dataclasses
 import enum
 import functools
 import inspect
+import logging
 import math
 from typing import Any, Literal, overload
 
@@ -38,6 +39,7 @@ from jaxlib.mlir.dialects import scf
 from jaxlib.mlir.dialects import vector
 import numpy as np
 
+logger = logging.getLogger(__name__)
 
 WARP_SIZE: int = 32
 WARPGROUP_SIZE: int = 128
@@ -2083,6 +2085,11 @@ def is_known_divisible(value: ir.Value, divisor: int, max_depth=10) -> bool:
         operand = op.operands[arg_index]
         return is_known_divisible(operand, divisor, new_depth)
       return False
+    # TODO(bchetioui): Clean up match once minimum supported jaxlib is 0.10.2
+    case op2 if hasattr(dialect, "AssumeMultipleOp") and isinstance(op2, dialect.AssumeMultipleOp):  # pyrefly: ignore[missing-attribute]
+      return ir.IntegerAttr(
+          op2.multiple  # pyrefly: ignore[missing-attribute]
+      ).value % divisor == 0 or is_known_divisible(op2.value, divisor, new_depth)  # pyrefly: ignore[missing-attribute]
     case arith.IndexCastOp():
       return is_known_divisible(def_op.in_, divisor, max_depth - 1)
     case arith.ConstantOp():
@@ -2112,6 +2119,21 @@ def is_known_divisible(value: ir.Value, divisor: int, max_depth=10) -> bool:
           is_known_divisible(def_op.lhs, divisor, new_depth)
           or is_known_divisible(def_op.rhs, divisor, new_depth)
       )
+    case arith.TruncIOp():
+      # Only cover the specific case where the divisor is a power of two.
+      # trunci(a, bitwidth) = a % 2**bitwidth = a - k * 2**bitwidth for some k.
+      # When the divisor is a power of 2, there are two cases:
+      #   1. the divisor is smaller than 2**bitwidth. In this case, the divisor
+      #      divides 2**bitwidth; if it divides a, it must thus also divide
+      #      the truncated value a - k*2**bitwidth for any k;
+      #   2. the divisor is larger than 2**bitwidth. In this case, if the
+      #      divisor divides a, then we can conclude that a % 2**bitwidth == 0,
+      #      and thus that the divisor also divides the truncated value.
+      return (divisor.bit_count() == 1 and
+              is_known_divisible(def_op.in_, divisor, new_depth))
+
+  logger.debug("Unsupported defining operation %s when "
+               "checking divisibility of %s", def_op, value)
 
   return False
 

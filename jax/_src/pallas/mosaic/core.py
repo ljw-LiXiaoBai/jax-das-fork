@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import collections
 from collections.abc import Mapping, Sequence
+import contextlib
 import dataclasses
 import enum
 from typing import Any, Literal
 
 import jax
 from jax._src import core as jax_core
+from jax._src import deprecations
 from jax._src import linear_util as lu
 from jax._src import state
 from jax._src import util
@@ -108,7 +110,7 @@ class CompilerParams:
     allow_collective_id_without_custom_barrier: Allow the use of collective_id
       without a custom barrier.
     use_tc_tiling_on_sc: Use TensorCore tiling for SparseCore. This flag is only
-      used for ``SC_*_SUBCORE`` kernels.
+      used for ``SC_*_SUBCORE`` kernels and it implicitly defaults to True.
     needs_layout_passes: Whether to use vector layout inference passes. This
       flag is temporary and will eventually be removed.
     fuse_transposed_lhs_in_matmul: Hint to compilers to attempt to fuse
@@ -136,7 +138,7 @@ class CompilerParams:
   allow_collective_id_without_custom_barrier: bool = False
   shape_invariant_numerics: bool = True
   use_tc_tiling_on_sc: bool | None = None
-  needs_layout_passes: bool = False
+  needs_layout_passes: bool = True
   fuse_transposed_lhs_in_matmul: bool = False
 
   def __init__(
@@ -155,7 +157,7 @@ class CompilerParams:
       allow_collective_id_without_custom_barrier: bool = False,
       shape_invariant_numerics: bool = True,
       use_tc_tiling_on_sc: bool | None = None,
-      needs_layout_passes: bool | None = None,
+      needs_layout_passes: bool = True,
       fuse_transposed_lhs_in_matmul: bool = False,
   ):
     object.__setattr__(
@@ -218,7 +220,17 @@ class MemorySpace(enum.Enum):
   CMEM = "cmem"
   SEMAPHORE = "semaphore_mem"
   HBM = "hbm"
-  HOST = "host"
+
+  def __getattr__(self, name):
+    if name == "HOST":
+      # Deprecated on June 4, 2026.
+      deprecations.warn(
+          "pltpu-memory-space-host",
+          "pltpu.MemorySpace.HOST is deprecated. Use pl.HOST instead.",
+          stacklevel=2,
+      )
+      return pallas_core.MemorySpace.HOST
+    super().__getattr__(name)  # pyrefly: ignore[missing-attribute]
 
   def __str__(self) -> str:
     return self.value
@@ -369,6 +381,10 @@ class TensorCoreMesh(pallas_core.Mesh):
         MemorySpace.SEMAPHORE,
     ]
 
+  @contextlib.contextmanager
+  def tracing_context(self):
+    yield
+
 
 def create_tensorcore_mesh(
     axis_name: str,
@@ -454,7 +470,7 @@ def pass_scalars_as_refs(
     if copy_to_smem:
       smem, args = util.split_list(args, [len(smem_alloc)])
       assert len(smem) == len(scalar_const_refs)
-      from jax._src.pallas.mosaic.helpers import sync_copy
+      from jax._src.pallas.mosaic.helpers import sync_copy  # pyrefly: ignore[missing-import]
 
       sync_copy(scalar_const_refs, smem)
     else:
@@ -603,10 +619,8 @@ def memory_space_to_tpu_memory_space(
           return MemorySpace.SMEM
         case _:
           raise ValueError(f"Unsupported core type: {core_type}")
-    case pallas_core.MemorySpace.ANY:
-      return pallas_core.MemorySpace.ANY
-    case pallas_core.MemorySpace.HOST:
-      return MemorySpace.HOST
+    case pallas_core.MemorySpace.ANY | pallas_core.MemorySpace.HOST:
+      return memory_space
     case (
         pallas_core.MemorySpace.ERROR
         | pallas_core.MemorySpace.INDEX

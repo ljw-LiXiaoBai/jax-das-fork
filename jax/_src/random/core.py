@@ -29,7 +29,8 @@ from jax._src import core
 from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import numpy as jnp
-from jax._src import prng
+from jax._src.random import prng
+from jax._src.random import threefry2x32
 from jax._src import xla_bridge
 from jax._src.mesh import get_abstract_mesh
 from jax._src.sharding_impls import NamedSharding, PartitionSpec as P
@@ -1266,8 +1267,8 @@ def beta(key: ArrayLike,
   if not dtypes.issubdtype(dtype, np.floating):
     raise ValueError(f"dtype argument to `beta` must be a float "
                      f"dtype, got {dtype}")
-  if shape is not None:
-    shape = core.canonicalize_shape(shape)
+  _check_all_safe_to_cast("beta", dtype, a, b)
+  shape = _check_broadcast_shapes("beta", shape, a, b)
   out_sharding = canonicalize_sharding_for_samplers(out_sharding, "beta", shape)
 
   return maybe_auto_axes(_beta, out_sharding,
@@ -1584,7 +1585,7 @@ def _gamma_impl(key, a, *, log_space, use_vmap=False):
   keys = keys.flatten()
   alphas = a.flatten()
 
-  if use_vmap and _key_impl(key) is prng.threefry_prng_impl:
+  if use_vmap and _key_impl(key) is threefry2x32.threefry_prng_impl:
     samples = vmap(partial(_gamma_one, log_space=log_space))(keys, alphas)
   else:
     samples = lax_control_flow.map(
@@ -1874,7 +1875,7 @@ def poisson(key: ArrayLike,
   # remove this check
   keys_dtype = typing.cast(prng.KeyTy, key.dtype)
   key_impl = keys_dtype._impl
-  if key_impl is not prng.threefry_prng_impl:
+  if key_impl is not threefry2x32.threefry_prng_impl:
     raise NotImplementedError(
         '`poisson` is only implemented for the threefry2x32 RNG, '
         f'not {key_impl}')
@@ -2232,19 +2233,14 @@ def pareto(key: ArrayLike,
   if not dtypes.issubdtype(dtype, np.floating):
     raise ValueError(f"dtype argument to `pareto` must be a float "
                      f"dtype, got {dtype}")
-  if shape is not None:
-    shape = core.canonicalize_shape(shape)
+  shape = _check_broadcast_shapes("pareto", shape, b)
+  _check_all_safe_to_cast("pareto", dtype, b)
   out_sharding = canonicalize_sharding_for_samplers(out_sharding, "pareto", shape)
   return maybe_auto_axes(_pareto, out_sharding,
                          shape=shape, dtype=dtype)(key, b)
 
 @jit(static_argnums=(2, 3))
 def _pareto(key, b, shape, dtype) -> Array:
-  if shape is None:
-    shape = np.shape(b)
-  else:
-    _check_shape("pareto", shape)
-
   b = lax.convert_element_type(b, dtype)
   e = exponential(key, shape, dtype)
   return lax.exp(e / b)
@@ -2252,7 +2248,7 @@ def _pareto(key, b, shape, dtype) -> Array:
 
 def t(key: ArrayLike,
       df: RealArray,
-      shape: Shape = (),
+      shape: Shape | None = None,
       dtype: DTypeLikeFloat | None = None,
       *,
       out_sharding: NamedSharding | P | None = None) -> Array:
@@ -2293,8 +2289,9 @@ def t(key: ArrayLike,
   if not dtypes.issubdtype(dtype, np.floating):
     raise ValueError(f"dtype argument to `t` must be a float "
                      f"dtype, got {dtype}")
-  shape = core.canonicalize_shape(shape)
+  shape = _check_broadcast_shapes("t", shape, df)
   out_sharding = canonicalize_sharding_for_samplers(out_sharding, "t", shape)
+  _check_all_safe_to_cast("t", dtype, df)
   return maybe_auto_axes(_t, out_sharding,
                          shape=shape, dtype=dtype)(key, df)
 
@@ -2359,6 +2356,7 @@ def chisquare(key: ArrayLike,
     raise ValueError("dtype argument to `chisquare` must be a float "
                      f"dtype, got {dtype}")
   shape = _check_broadcast_shapes("chisquare", shape, df)
+  _check_all_safe_to_cast("chisquare", dtype, df)
   out_sharding = canonicalize_sharding_for_samplers(out_sharding, "chisquare", shape)
   return _chisquare(key, df, shape, dtype, out_sharding)
 
@@ -2424,6 +2422,7 @@ def f(key: ArrayLike,
                      f"dtype, got {dtype}")
   shape = _check_broadcast_shapes("f", shape, dfnum, dfden)
   out_sharding = canonicalize_sharding_for_samplers(out_sharding, "f", shape)
+  _check_all_safe_to_cast("f", dtype, dfnum, dfden)
   return _f(key, dfnum, dfden, shape, dtype, out_sharding)
 
 @jit(static_argnums=(3, 4, 5))
@@ -2488,7 +2487,9 @@ def _rademacher(key, shape, dtype, out_sharding) -> Array:
 
 def maxwell(key: ArrayLike,
             shape: Shape = (),
-            dtype: DTypeLikeFloat | None = None) -> Array:
+            dtype: DTypeLikeFloat | None = None,
+            *,
+            out_sharding: NamedSharding | P | None = None) -> Array:
   r"""Sample from a one sided Maxwell distribution.
 
   The values are distributed according to the probability density function:
@@ -2500,8 +2501,17 @@ def maxwell(key: ArrayLike,
 
   Args:
     key: a PRNG key.
-    shape: The shape of the returned samples.
-    dtype: The type used for samples.
+    shape: optional, the batch dimensions of the result. Default ().
+    dtype: optional, a float dtype for the returned values (default float64 if
+      jax_enable_x64 is true, otherwise float32).
+    out_sharding: optional, specifies how the output array should be sharded
+      across devices in multi-device computation. Can be a
+      :class:`~jax.sharding.NamedSharding`, a :class:`~jax.sharding.PartitionSpec`
+      (``P``), or ``None`` (default). When specified, the output will be sharded
+      according to the given sharding specification. Primarily used in explicit
+      sharding mode.
+      See the `explicit sharding tutorial <https://docs.jax.dev/en/latest/parallel.html>`_
+      for more details.
 
   Returns:
     A jnp.array of samples, of shape `shape`.
@@ -2516,13 +2526,18 @@ def maxwell(key: ArrayLike,
     raise ValueError(f"dtype argument to `maxwell` must be a float "
                      f"dtype, got {dtype}")
   shape = core.canonicalize_shape(shape)
-  return _maxwell(key, shape, dtype)
+  out_sharding = canonicalize_sharding_for_samplers(out_sharding, "maxwell", shape)
+  return _maxwell(key, shape, dtype, out_sharding)
 
 
-@jit(static_argnums=(1, 2))
-def _maxwell(key, shape, dtype) -> Array:
+@jit(static_argnums=(1, 2, 3))
+def _maxwell(key, shape, dtype, out_sharding) -> Array:
   shape = shape + (3,)
-  norm_rvs = normal(key=key, shape=shape, dtype=dtype)
+  if out_sharding is not None:
+    new_partitions = (*out_sharding.spec, None)
+    out_sharding = out_sharding.update(
+        spec=out_sharding.spec.update(partitions=new_partitions))
+  norm_rvs = normal(key=key, shape=shape, dtype=dtype, out_sharding=out_sharding)
   return jnp_linalg.norm(norm_rvs, axis=-1)
 
 
@@ -2696,7 +2711,9 @@ def generalized_normal(
   key: ArrayLike,
   p: float,
   shape: Shape = (),
-  dtype: DTypeLikeFloat | None = None
+  dtype: DTypeLikeFloat | None = None,
+  *,
+  out_sharding: NamedSharding | P | None = None,
 ) -> Array:
   r"""Sample from the generalized normal distribution.
 
@@ -2714,6 +2731,14 @@ def generalized_normal(
     shape: optional, the batch dimensions of the result. Default ().
     dtype: optional, a float dtype for the returned values (default float64 if
       jax_enable_x64 is true, otherwise float32).
+    out_sharding: optional, specifies how the output array should be sharded
+      across devices in multi-device computation. Can be a
+      :class:`~jax.sharding.NamedSharding`, a :class:`~jax.sharding.PartitionSpec`
+      (``P``), or ``None`` (default). When specified, the output will be sharded
+      according to the given sharding specification. Primarily used in explicit
+      sharding mode.
+      See the `explicit sharding tutorial <https://docs.jax.dev/en/latest/parallel.html>`_
+      for more details.
 
   Returns:
     A random array with the specified shape and dtype.
@@ -2723,6 +2748,12 @@ def generalized_normal(
   dtype = dtypes.check_and_canonicalize_user_dtype(
       float if dtype is None else dtype)
   _check_shape("generalized_normal", shape)
+  out_sharding = canonicalize_sharding_for_samplers(
+      out_sharding, "generalized_normal", shape)
+  return maybe_auto_axes(_generalized_normal, out_sharding, shape=shape, dtype=dtype)(key, p)
+
+@jit(static_argnums=(2, 3))
+def _generalized_normal(key, p, shape, dtype):
   keys = split(key)
   g = gamma(keys[0], 1/p, shape, dtype)
   r = rademacher(keys[1], shape, dtype)
@@ -2821,18 +2852,14 @@ def rayleigh(key: ArrayLike,
   if not dtypes.issubdtype(dtype, np.floating):
     raise ValueError("dtype argument to `rayleigh` must be a float "
                      f"dtype, got {dtype}")
-  if shape is not None:
-    shape = core.canonicalize_shape(shape)
+  shape = _check_broadcast_shapes("rayleigh", shape, scale)
   out_sharding = canonicalize_sharding_for_samplers(out_sharding, "rayleigh", shape)
+  _check_all_safe_to_cast("rayleigh", dtype, scale)
   return maybe_auto_axes(_rayleigh, out_sharding,
                          shape=shape, dtype=dtype)(key, scale)
 
 @jit(static_argnums=(2, 3))
 def _rayleigh(key, scale, shape, dtype) -> Array:
-  if shape is None:
-    shape = np.shape(scale)
-  else:
-    _check_shape("rayleigh", shape, np.shape(scale))
   u = uniform(key, shape, dtype)
   scale = scale.astype(dtype)
   scale = jnp.broadcast_to(scale, shape)
@@ -2910,7 +2937,9 @@ def _wald(key, mean, shape, dtype) -> Array:
 def geometric(key: ArrayLike,
               p: RealArray,
               shape: Shape | None = None,
-              dtype: DTypeLikeInt | None = None) -> Array:
+              dtype: DTypeLikeInt | None = None,
+              *,
+              out_sharding: NamedSharding | P | None = None) -> Array:
   r"""Sample Geometric random values with given shape and float dtype.
 
   The values are returned according to the probability mass function:
@@ -2929,6 +2958,14 @@ def geometric(key: ArrayLike,
       (None) produces a result shape equal to ``np.shape(p)``.
     dtype: optional, a int dtype for the returned values (default int64 if
       jax_enable_x64 is true, otherwise int32).
+    out_sharding: optional, Specifies how the output array should be sharded
+      across devices in multi-device computation. Can be a
+      :class:`~jax.sharding.NamedSharding`, a :class:`~jax.sharding.PartitionSpec`
+      (``P``), or ``None`` (default). When specified, the output will be sharded
+      according to the given sharding specification. Primarily used in explicit
+      sharding mode.
+      See the `explicit sharding tutorial <https://docs.jax.dev/en/latest/parallel.html>`_
+      for more details.
 
   Returns:
     A random array with the specified dtype and with shape given by ``shape`` if
@@ -2940,22 +2977,22 @@ def geometric(key: ArrayLike,
   if not dtypes.issubdtype(dtype, np.integer):
     raise ValueError("dtype argument to `geometric` must be an int "
                      f"dtype, got {dtype}")
-  if shape is not None:
-    shape = core.canonicalize_shape(shape)
-  return _geometric(key, p, shape, dtype)
+  shape = _check_broadcast_shapes("geometric", shape, p)
+  out_sharding = canonicalize_sharding_for_samplers(out_sharding, "geometric", shape)
+  return _geometric(key, p, shape, dtype, out_sharding)
 
-@jit(static_argnums=(2, 3))
-def _geometric(key, p, shape, dtype) -> Array:
-  if shape is None:
-    shape =  np.shape(p)
-  else:
-    _check_shape("geometric", shape, np.shape(p))
+@jit(static_argnums=(2, 3, 4))
+def _geometric(key, p, shape, dtype, out_sharding) -> Array:
   check_arraylike("geometric", p)
   p, = promote_dtypes_inexact(p)
-  u = uniform(key, shape, p.dtype)
+  u = uniform(key, shape, p.dtype, out_sharding=out_sharding)
+  # TODO(jakevdp): switch to log_u = lax.log1p(u - 1)
+  # For now we map u=0 to u=1 to avoid inf in log_u without otherwise
+  # changing samples produced for a given key.
+  u = jnp.where(u == 0, 1, u)
   log_u = lax.log(u)
   log_one_minus_p = lax.log1p(-p)
-  log_one_minus_p = jnp.broadcast_to(log_one_minus_p, shape)
+  log_one_minus_p = jnp.broadcast_to(log_one_minus_p, shape, out_sharding=out_sharding)
   g = lax.floor(lax.div(log_u, log_one_minus_p)) + 1
   return g.astype(dtype)
 
@@ -2965,7 +3002,9 @@ def triangular(key: ArrayLike,
                mode: RealArray,
                right: RealArray,
                shape: Shape | None = None,
-               dtype: DTypeLikeFloat | None = None) -> Array:
+               dtype: DTypeLikeFloat | None = None,
+               *,
+               out_sharding: NamedSharding | P | None = None) -> Array:
   r"""Sample Triangular random values with given shape and float dtype.
 
   The values are returned according to the probability density function:
@@ -2991,6 +3030,14 @@ def triangular(key: ArrayLike,
       and ``right.shape``.
     dtype: optional, a float dtype for the returned values (default float64 if
       jax_enable_x64 is true, otherwise float32).
+    out_sharding: optional, specifies how the output array should be sharded
+      across devices in multi-device computation. Can be a
+      :class:`~jax.sharding.NamedSharding`, a :class:`~jax.sharding.PartitionSpec`
+      (``P``), or ``None`` (default). When specified, the output will be sharded
+      according to the given sharding specification. Primarily used in explicit
+      sharding mode.
+      See the `explicit sharding tutorial <https://docs.jax.dev/en/latest/parallel.html>`_
+      for more details.
 
   Returns:
     A random array with the specified dtype and with shape given by ``shape`` if
@@ -3002,20 +3049,17 @@ def triangular(key: ArrayLike,
   if not dtypes.issubdtype(dtype, np.floating):
     raise ValueError("dtype argument to `triangular` must be a float "
                      f"dtype, got {dtype}")
-  if shape is not None:
-    shape = core.canonicalize_shape(shape)
-  return _triangular(key, left, mode, right, shape, dtype)
+  shape = _check_broadcast_shapes("triangular", shape, left, mode, right)
+  out_sharding = canonicalize_sharding_for_samplers(out_sharding, "triangular", shape)
+  _check_all_safe_to_cast("triangular", dtype, left, mode, right)
+  return maybe_auto_axes(_triangular, out_sharding, shape=shape, dtype=dtype)(key, left, mode, right)
 
 @jit(static_argnums=(4, 5), inline=True)
 def _triangular(key, left, mode, right, shape, dtype) -> Array:
   # https://en.wikipedia.org/wiki/Triangular_distribution#Generating_triangular-distributed_random_variates
-  if shape is None:
-    shape =  lax.broadcast_shapes(np.shape(left), np.shape(mode), np.shape(right))
-  else:
-    _check_shape("triangular", shape, np.shape(left), np.shape(mode), np.shape(right))
-  left = jnp.broadcast_to(left, shape)
-  mode = jnp.broadcast_to(mode, shape)
-  right = jnp.broadcast_to(right, shape)
+  left = jnp.broadcast_to(lax.convert_element_type(left, dtype), shape)
+  right = jnp.broadcast_to(lax.convert_element_type(right, dtype), shape)
+  mode = jnp.broadcast_to(lax.convert_element_type(mode, dtype), shape)
   fc = (mode - left) / (right - left)
   u = uniform(key, shape, dtype)
   out1 = left + lax.sqrt(u * (right - left) * (mode - left))

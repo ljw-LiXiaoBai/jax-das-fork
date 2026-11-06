@@ -34,13 +34,15 @@ from jax._src.lib import _jax
 from jax._src.lib import guard_lib
 from jax._src.lib import jax_jit
 from jax._src.lib import xla_client
+from jax._src.lib import jaxlib_extension_version
 
-config_ext = xla_client._xla.config
+config_ext = _jax.config
 
 logger = logging.getLogger(__name__)
 
 _T = TypeVar('_T')
 _ET = TypeVar('_ET', bound=enum.Enum)
+_F = TypeVar('_F', bound=Callable[..., Any])
 
 class EffortLevel(enum.Enum):
   """Effort level enum, mirroring the XLA effort options."""
@@ -226,6 +228,13 @@ class Config:
 register_trace_context_callback = []
 
 trace_context = config_ext.trace_context
+if jaxlib_extension_version >= 455:
+  trace_context_names = config_ext.trace_context_names
+else:
+  def trace_context_names():
+    raise NotImplementedError(
+        'trace_context_names is not supported in this JAX version.'
+    )
 
 config = Config()
 
@@ -304,7 +313,7 @@ class State(config_ext.Config[_T]):
     update_global_hook(self.get_global())
 
 
-class StateContextManager(contextlib.ContextDecorator):
+class StateContextManager:
   __slots__ = ['state', 'new_val', 'prev']
 
   def __init__(self, state, new_val):
@@ -324,7 +333,6 @@ class StateContextManager(contextlib.ContextDecorator):
     else:
       self.new_val = new_val
 
-
   def __enter__(self):
     self.prev = self.state.swap_local(self.new_val)
     if self.state._update_thread_local_hook:
@@ -337,6 +345,13 @@ class StateContextManager(contextlib.ContextDecorator):
         self.state._update_thread_local_hook(None)
       else:
         self.state._update_thread_local_hook(cast(Optional[Any], self.prev))
+
+  def __call__(self, func: _F) -> _F:
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+      with StateContextManager(self.state, self.new_val):
+        return func(*args, **kwargs)
+    return cast(_F, wrapper)
 
 
 UPGRADE_BOOL_HELP = (
@@ -1054,6 +1069,7 @@ def make_user_context(default_value=None):
   """
   return UserConfig(default_value)
 
+jax_jit_cpp_cache_obj = make_user_context(None)
 
 # TODO(b/214340779): remove flag when XLA:CPU is improved.
 jax2tf_associative_scan_reductions = bool_state(
@@ -1199,6 +1215,11 @@ captured_constants_report_frames = int_state(
     )
 )
 
+debug_leaked_clients_on_clear_backends = bool_state(
+    name='jax_debug_leaked_clients_on_clear_backends',
+    default=False,
+    help=('Check that clear_backends actually clears the backends.'))
+
 debug_nans = bool_state(
     name='jax_debug_nans',
     default=False,
@@ -1248,6 +1269,15 @@ scan3 = bool_state(
 )
 
 
+remat3 = bool_state(
+    name='jax_remat3',
+    default=False,
+    upgrade=True,
+    help='If True, embrace the future of remat.',
+    include_in_jit_key=True,
+    include_in_trace_context=True,
+)
+
 custom_vjp3 = bool_state(
     name='jax_custom_vjp3',
     default=False,
@@ -1295,7 +1325,7 @@ enable_custom_prng = bool_state(
 
 default_prng_impl = enum_state(
     name='jax_default_prng_impl',
-    enum_values=['threefry2x32', 'rbg', 'unsafe_rbg'],
+    enum_values=['threefry2x32', 'threefry4x32', 'rbg', 'unsafe_rbg', 'philox2x32', 'philox4x32'],
     default='threefry2x32',
     help=('Select the default PRNG implementation, used when one is not '
           'explicitly provided at seeding time.'))
@@ -1789,6 +1819,15 @@ traceback_filtering = enum_state(
          "a brief message (to the ``__cause__`` of the exception) describing that this has "
          "happened.\n\n")
 
+# TODO(rdyro): Remove once we always enable emit_pipeline primitive.
+use_emit_pipeline_primitive = bool_state(
+    name = 'jax_use_emit_pipeline_primitive',
+    default=False,
+    help="Controls whether to use the emit_pipeline primitive.",
+    include_in_jit_key=True,
+    include_in_trace_context=True)
+
+
 # This flag is for internal use.
 # TODO(tianjianlu): Removes once we always enable cusparse lowering.
 # TODO(b/262050896): Set to true after bug is fixed
@@ -2254,17 +2293,45 @@ jax_ragged_dot_use_gpu_pallas_triton_lowering = bool_state(
     include_in_trace_context=True,
 )
 
-pallas_enable_debug_checks = bool_state(
-    "jax_pallas_enable_debug_checks",
-    default=False,
-    help=(
-        "If set, ``pl.debug_check`` calls are checked at runtime. Otherwise,"
-        " they are a noop."
-    ),
+jax_pallas_verbose_errors = bool_flag(
+    'jax_pallas_verbose_errors',
+    default=bool_env('JAX_PALLAS_VERBOSE_ERRORS', False),
+    help='If True, print verbose error messages for Pallas kernels.',
 )
 
-jax_pallas_verbose_errors = bool_flag(
-    "jax_pallas_verbose_errors",
-    default=bool_env("JAX_PALLAS_VERBOSE_ERRORS", False),
-    help="If True, print verbose error messages for Pallas kernels.",
+jax_pallas_enable_debug_checks = bool_state(
+    name='jax_pallas_enable_debug_checks',
+    default=False,
+    help=(
+        'If set, ``pl.debug_check`` calls are checked at runtime. Otherwise,'
+        ' they are a noop.'
+    ),
+    include_in_jit_key=True,
+    include_in_trace_context=True,
+)
+
+jax_pallas_use_mosaic_gpu = bool_state(
+    name='jax_pallas_use_mosaic_gpu',
+    default=bool_env('JAX_PALLAS_USE_MOSAIC_GPU', True),
+    help=(
+        'If True, lower Pallas kernels to the experimental Mosaic GPU'
+        ' dialect, instead of Triton IR.'
+    ),
+    include_in_jit_key=True,
+    include_in_trace_context=True,
+)
+
+jax_mosaic_allow_hlo = bool_state(
+    name='jax_mosaic_allow_hlo',
+    default=False,
+    help='Allow hlo dialects in Mosaic',
+)
+
+jax_pallas_poison_buffers = bool_state(
+    name="jax_pallas_poison_buffers",
+    default=False,
+    help=(
+        "If set, scratch buffers allocated by Pallas (e.g., in run_scoped)"
+        " are initialized with poison values (NaN for floats) at allocation time."
+    ),
 )

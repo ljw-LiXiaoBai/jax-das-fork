@@ -35,7 +35,8 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax._src import config
 from jax._src import core
-from jax._src import prng
+from jax._src.random import prng
+from jax._src.random import threefry2x32
 from jax._src.shard_map import shard_map
 from jax._src import test_util as jtu
 from jax._src.util import safe_zip, safe_map, partition_list, merge_lists
@@ -371,7 +372,7 @@ class ShardMapTest(jtu.JaxTestCase):
         shard_map, mesh=mesh, in_specs=(P('x', None),), out_specs=P('x', None)
     )
     def fwd(a):
-      return_dtype_and_shape = jax.ShapeDtypeStruct(a.shape, a.dtype)
+      return_dtype_and_shape = jax.ShapeDtypeStruct.like(a)
       fwd_token = jax.lax.psend(a, 'x', [(0, 1)])
       data = jax.lax.precv(
           fwd_token, return_dtype_and_shape, 'x', [(0, 1)])
@@ -417,7 +418,7 @@ class ShardMapTest(jtu.JaxTestCase):
         jax.shard_map, mesh=mesh, in_specs=(P('x', None),), out_specs=P('x', None)
     )
     def fwd(a):
-      return_dtype_and_shape = jax.ShapeDtypeStruct(a.shape, a.dtype)
+      return_dtype_and_shape = jax.ShapeDtypeStruct.like(a)
 
       # We define the "forward edge" to be the device-to-device communication
       # originating from device 0 in increasing indices.
@@ -481,7 +482,7 @@ class ShardMapTest(jtu.JaxTestCase):
         out_specs=P('x', None),
     )
     def fwd(a):
-      return_dtype_and_shape = jax.ShapeDtypeStruct(a.shape, a.dtype)
+      return_dtype_and_shape = jax.ShapeDtypeStruct.like(a)
       fwd_token = jax.lax.psend(
           a,
           axis_name='x',
@@ -520,7 +521,7 @@ class ShardMapTest(jtu.JaxTestCase):
         out_specs=P('x', None),
     )
     def fwd(a):
-      return_dtype_and_shape = jax.ShapeDtypeStruct(a.shape, a.dtype)
+      return_dtype_and_shape = jax.ShapeDtypeStruct.like(a)
       data = jax.lax.precv(
           jax.lax.create_token(),
           out_shape=return_dtype_and_shape,
@@ -551,7 +552,7 @@ class ShardMapTest(jtu.JaxTestCase):
         out_specs=P('x', None),
     )
     def fwd(a):
-      return_dtype_and_shape = jax.ShapeDtypeStruct(a.shape, a.dtype)
+      return_dtype_and_shape = jax.ShapeDtypeStruct.like(a)
       fwd_token = jax.lax.psend(
           a,
           axis_name='x',
@@ -590,7 +591,7 @@ class ShardMapTest(jtu.JaxTestCase):
         out_specs=P('x', None),
     )
     def fwd(a):
-      return_dtype_and_shape = jax.ShapeDtypeStruct(a.shape, a.dtype)
+      return_dtype_and_shape = jax.ShapeDtypeStruct.like(a)
       fwd_token = jax.lax.psend(
           a,
           axis_name='x',
@@ -624,7 +625,7 @@ class ShardMapTest(jtu.JaxTestCase):
         jax.shard_map, mesh=mesh, in_specs=(P('x', None),), out_specs=P('x', None)
     )
     def fwd(a):
-      return_dtype_and_shape = jax.ShapeDtypeStruct(a.shape, a.dtype)
+      return_dtype_and_shape = jax.ShapeDtypeStruct.like(a)
       dummy_data = jax.lax.precv(
           jax.lax.create_token(),
           out_shape=return_dtype_and_shape,
@@ -1426,7 +1427,7 @@ class ShardMapTest(jtu.JaxTestCase):
 
     @jax.shard_map(in_specs=P('x'), out_specs=(P('x'), P('x')))
     def per_shard(x_shard):
-      spec = jax.ShapeDtypeStruct(x_shard.shape, x_shard.dtype)
+      spec = jax.ShapeDtypeStruct.like(x_shard)
       return jax.pure_callback(host_kernel, (spec, spec), x_shard)
 
     x = jax.device_put(np.arange(32, dtype=np.float32).reshape(16, 2), P('x'))
@@ -1447,6 +1448,30 @@ class ShardMapTest(jtu.JaxTestCase):
 
     jax.jit(jax.grad(f2))(x1)  # doesn't crash
     jax.grad(f2)(x1)  # doesn't crash
+
+  @jtu.with_explicit_mesh((2,), 'x')
+  def test_shmap_bwd_rep_to_unreduced_check_vma_true(self, mesh):
+    arr = jax.device_put(np.arange(8.), P(reduced={'x'}))
+    rep_arr = jax.device_put(np.arange(8.), P())
+
+    @jax.jit
+    @jax.shard_map(out_specs=P(reduced={'x'}))
+    def f(x):
+      return x * x
+
+    out = f(arr)
+    self.assertEqual(out.sharding, NamedSharding(mesh, P(None, reduced={'x'})))
+
+    out_g = jax.jit(jax.grad(lambda x: f(x).sum()))(arr)
+    self.assertEqual(out_g.sharding, NamedSharding(mesh, P(None, unreduced={'x'})))
+
+    @jax.jit
+    @jax.shard_map(out_specs=P())
+    def g(x):
+      return x * x
+
+    expected_out_g = jax.jit(jax.grad(lambda x: g(x).sum()))(rep_arr)
+    self.assertArraysEqual(jax.reshard(out_g, P()), expected_out_g)
 
   @jtu.run_on_devices('cpu', 'gpu', 'tpu')
   @jtu.thread_unsafe_test()
@@ -2636,6 +2661,9 @@ class ShardMapTest(jtu.JaxTestCase):
 
   @jtu.with_explicit_mesh((2, 2), ('data', 'seq'))
   def test_shmap_unreduced_fsdp_custom_vjp_bwd(self, mesh):
+    if jtu.is_device_tpu(7, "x") and not jtu.is_cloud_tpu_at_least(2026, 6, 9):
+      self.skipTest("Test fails in CI")
+
     np_inp1 = np.arange(64.).reshape(8, 4, 2)
     np_inp2 = np.arange(12.).reshape(2, 6)
     arr1 = jax.device_put(np_inp1, P('data', 'seq', None))
@@ -3213,7 +3241,7 @@ class ShardMapTest(jtu.JaxTestCase):
     mesh = jtu.create_mesh((2, 2, 2), ('x', 'y', 'z'))
 
     np_inp = np.arange(math.prod(shape), dtype=np.uint32).reshape(shape)
-    key = prng.random_seed(np_inp, impl=prng.threefry_prng_impl)
+    key = prng.random_seed(np_inp, impl=threefry2x32.threefry_prng_impl)
     key = jax.device_put(key, NamedSharding(mesh, P()))
 
     @jax.jit
@@ -4355,6 +4383,8 @@ class ShardMapTest(jtu.JaxTestCase):
 
   @jtu.with_explicit_mesh((2,), 'x')
   def test_eager_reduced_out(self, mesh):
+    if jtu.test_device_matches(["tpu"]) and not jtu.is_cloud_tpu_at_least(2026, 5, 26):
+      self.skipTest("Requires libtpu built on or after 2026-05-26")
     arr = jax.device_put(np.arange(8.), P('x'))
 
     @shard_map(out_specs=P(reduced={'x'}))
@@ -4371,6 +4401,8 @@ class ShardMapTest(jtu.JaxTestCase):
 
   @jtu.with_explicit_mesh((2,), 'x')
   def test_eager_reduced_in(self, mesh):
+    if jtu.test_device_matches(["tpu"]) and not jtu.is_cloud_tpu_at_least(2026, 5, 26):
+      self.skipTest("Requires libtpu built on or after 2026-05-26")
     arr = jax.device_put(np.arange(8.), P(reduced={'x'}))
 
     @shard_map(out_specs=P('x'))
@@ -4388,6 +4420,8 @@ class ShardMapTest(jtu.JaxTestCase):
 
   @jtu.with_explicit_mesh((2,), 'x')
   def test_eager_unreduced_out(self, mesh):
+    if jtu.test_device_matches(["tpu"]) and not jtu.is_cloud_tpu_at_least(2026, 5, 26):
+      self.skipTest("Requires libtpu built on or after 2026-05-26")
     arr = jax.device_put(np.arange(8.), P('x'))
 
     @shard_map(out_specs=P(unreduced={'x'}))
@@ -5328,9 +5362,62 @@ class ShardMapTest(jtu.JaxTestCase):
       f = jax.jit(f)
     x = jax.device_put(jnp.zeros((2, 2)), jax.P('i', None))
     y = jax.device_put(jnp.zeros((2, 2)), jax.P())
-    with self.assertRaisesRegex(ValueError, 'requires varying manual axes to match'):
+    with self.assertRaisesRegex(
+        ValueError, 'requires varying manual axes to match'):
       with config.auto_pcast(False):
         f(x, y)
+
+  @jtu.with_explicit_mesh((2, 2, 2), ('x', 'y', 'z'),
+                          axis_types=(AxisType.Auto,) * 3)
+  def test_nested_shmap_innermost_no_axis_names(self, mesh):
+    arr = jnp.ones((4,))
+
+    def h(x):
+      return jax.shard_map(lambda y: y * 2, in_specs=P(), out_specs=P())(x)
+
+    def g(x):
+      return jax.shard_map(h, in_specs=P(), out_specs=P(), axis_names={"y"})(x)
+
+    @jax.jit
+    def f(x):
+      return jax.shard_map(g, in_specs=P(), out_specs=P(), axis_names={"x"})(x)
+
+    out = f(arr)
+    self.assertArraysEqual(out, arr * 2)
+
+  @jtu.with_explicit_mesh((2,), 'x')
+  def test_check_vma_false_reduced_fwd_no_psum_on_bwd(self, mesh):
+    arr = jax.device_put(np.arange(8, dtype=np.float32), P(reduced={'x'}))
+
+    @jax.jit
+    @jax.shard_map(in_specs=P(reduced={'x'}), out_specs=P('x'), check_vma=False)
+    def f(x):
+      return core.reduced_vary_cast(x, 'x')
+
+    jf = jax.jit(jax.grad(lambda x: f(x).sum()))
+    jaxpr = jf.trace(arr).jaxpr
+    self.assertNotIn('psum', str(jaxpr))
+    out_g = jf(arr)
+    self.assertEqual(out_g.sharding, NamedSharding(mesh, P(None, unreduced={'x'})))
+
+  @jtu.with_explicit_mesh((2,), 'x')
+  def test_check_vma_false_unreduced_fwd_psum_on_bwd(self, mesh):
+    arr = jax.device_put(jnp.arange(8, dtype=np.float32), P(unreduced={'x'}))
+
+    @jax.jit
+    @jax.shard_map(in_specs=P(unreduced={'x'}), out_specs=P('x'), check_vma=False)
+    def f(x):
+      return jax.lax.psum_scatter(x, 'x', tiled=True)
+
+    jf = jax.jit(jax.grad(lambda x: f(x).sum()))
+    jaxpr = jf.trace(arr).jaxpr
+    # This behaves similar to invarying where shmap adds an extra psum so that
+    # numerics are correct. But we can also decide to leave it to the user and
+    # not insert a psum. But for now, let's test the current behavior and we can
+    # change the test later if we decide to not insert psums for reduced.
+    self.assertIn('psum', str(jaxpr))
+    out_g = jf(arr)
+    self.assertEqual(out_g.sharding, NamedSharding(mesh, P(None, reduced={'x'})))
 
 
 class FunSpec(NamedTuple):

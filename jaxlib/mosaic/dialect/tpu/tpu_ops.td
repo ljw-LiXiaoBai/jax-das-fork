@@ -519,29 +519,6 @@ def TPU_VectorStoreIdxOp :TPU_Op<"vector_store_idx", [DefaultMemWrite, AttrSized
   let hasVerifier = 1;
 }
 
-// TODO(jevinjiang): deprecate to use dynamic_rotate.
-def TPU_RotateOp : TPU_Op<"rotate", [Pure, SameOperandsAndResultType]> {
-  let description = [{
-    Rotates the given vector by the given amount in the given dimension, i.e.,
-    for a 2D vector of shape (m, n), rotating dim 0 by `amount` will shift a row
-    at index `i` to index `(i + amount) % m`
-  }];
-  let arguments = (ins
-    AnyVectorOfNonZeroRank:$value,
-    SI32Attr:$amount,
-    SI32Attr:$dimension,
-    // When the stride is specified, the rotation amount for each index on the
-    // stride dimension will be (amount + stride * index).
-    OptionalAttr<SI32Attr>:$stride,
-    OptionalAttr<SI32Attr>:$stride_dimension
-  );
-  let results = (outs AnyVectorOfNonZeroRank:$result);
-  let assemblyFormat = [{
-    $value `by` $amount `dim` $dimension (`stride` $stride `stride_dim` $stride_dimension^)? attr-dict `:` type($value)
-  }];
-  let hasVerifier = 1;
-}
-
 def TPU_DynamicRotateOp : TPU_Op<"dynamic_rotate", [Pure, AllTypesMatch<["value", "result"]>]> {
   let arguments = (ins
     AnyVectorOfNonZeroRank:$value,
@@ -712,7 +689,7 @@ def TPU_UnpackSubelementsOp : TPU_Op<"unpack_subelements", [Pure]> {
 }
 
 // unsigned_integers applies to the result type (for the source type the sign
-// doesn't matter: integer-to-integer conversions truncate the high bits, 
+// doesn't matter: integer-to-integer conversions truncate the high bits,
 // floats are always signed).
 // Float to integer packing rounds to nearest even.
 // WARNING: pack(pack(a, b), pack(c, d)) == pack(a, b, c, d) only holds for
@@ -821,13 +798,24 @@ def TPU_UnpackElementwiseOp : TPU_Op<"unpack_elementwise", [Pure, ElementwiseMap
     The `index` selects which packed value to extract from each word of `source`.
     An `index` of 0 corresponds to the lowest bits. The extracted values are
     cast to the output element type.
+
+    NOTE: The op follows the *interleaved format* during unpacking.
+    See `TPU_UnpackSubelementsOp` for more details.
+
+    For example, if `source_type` is i4, result type is i8, and `source` is
+    packed i8 with x'y'z'w'm'n'i'j' in a word, where each character represents 4
+    bits:
+
+    When `index=0`, the result is a packed i8 with s_y'y's_w'w's_n'n's_j'j';
+    When `index=1`, the result is a packed i8 with s_x'x's_z'z's_m'm's_i'i'.
+    With `s_x` indicating the MSB of `x`, and so on.
   }];
   let arguments = (ins
-    VectorOfNonZeroRankOf<[I32]>:$source,
+    VectorOfNonZeroRankOf<[AnyInteger]>:$source,
     TypeAttr:$source_type,
     I32Attr:$index
   );
-  let results = (outs VectorOfNonZeroRankOf<[F32, I32]>:$output);
+  let results = (outs VectorOfNonZeroRankOf<[F32, AnyInteger]>:$output);
   let assemblyFormat = [{ $source `,` $index attr-dict `:` type($source) `->` type($output) }];
   let hasVerifier = 1;
 }
@@ -1249,19 +1237,24 @@ def TPU_MemRefBitcastOp : TPU_Op<"memref_bitcast", [Pure]> {
   let hasCanonicalizeMethod = 1;
 }
 
-def TPU_ReinterpretCastOp : TPU_Op<"reinterpret_cast", [Pure]> {
+def TPU_ReinterpretCastOp : TPU_Op<"reinterpret_cast", [Pure, AttrSizedOperandSegments]> {
   let arguments = (ins
     AnyMemRef:$input,
     // Dynamic offset shifts the memref pointer by the specified number of
     // elements of the output type.
     // NOTE: The size of the shift must be a multiple of the memory space word
     // size for lowering to succeed.
-    Optional<I32>:$dynamic_offset
+    Optional<I32>:$dynamic_offset,
+    Variadic<I32>:$dynamic_sizes
   );
   let results = (outs AnyMemRef:$result);
   let assemblyFormat = [{
-    $input ($dynamic_offset^)? attr-dict `:` type($input) `->` type($result)
+    $input ($dynamic_offset^)? (`<` $dynamic_sizes^ `>`)? attr-dict `:` type($input) `->` type($result)
   }];
+  let skipDefaultBuilders = 1;
+  let builders = [
+    OpBuilder<(ins "::mlir::Type":$result_type, "::mlir::Value":$input, CArg<"::mlir::Value", "nullptr">:$dynamic_offset, CArg<"::mlir::ValueRange", "{}">:$dynamic_sizes)>
+  ];
   let hasVerifier = 1;
 }
 
@@ -1305,6 +1298,24 @@ def TPU_DeviceIdOp : TPU_Op<"device_id", [Pure]> {
   let assemblyFormat = [{ attr-dict `:` type($result) }];
 }
 
+// Returns the logical ID of the current core.
+// Querying Core ID is not supported in kernels that use dimension semantics.
+def TPU_CoreIdOp : TPU_Op<"core_id", [Pure]> {
+  let arguments = (ins);
+  let results = (outs I32:$result);
+  let assemblyFormat = [{ attr-dict `:` type($result) }];
+  let hasVerifier = 1;
+}
+
+// Returns the logical ID of the current subcore.
+// Querying Subcore ID is not supported in kernels that use dimension semantics.
+def TPU_SubcoreIdOp : TPU_Op<"subcore_id", [Pure]> {
+  let arguments = (ins);
+  let results = (outs I32:$result);
+  let assemblyFormat = [{ attr-dict `:` type($result) }];
+  let hasVerifier = 1;
+}
+
 def TPU_SemaphoreReadOp : TPU_Op<"sem_read"> {
   let arguments = (ins MemRefOf<[TPU_SemaphoreType, TPU_DMASemaphoreType]>:$semaphore);
   let results = (outs I32:$result);
@@ -1339,15 +1350,20 @@ def TPU_SemaphoreSignalOp : TPU_Op<"sem_signal", [AttrSizedOperandSegments]> {
     MemRefOf<[TPU_SemaphoreType]>:$semaphore,
     I32:$amount,
     Optional<I32>:$device_id, // For remote DMAs
-    Optional<I32>:$core_id
+    Optional<I32>:$core_id,
+    Optional<I32>:$subcore_id
   );
 let assemblyFormat = [{
-    $semaphore `,` $amount (`device_id` $device_id^)? (`core_id` $core_id^)? attr-dict `:` type($semaphore)
+    $semaphore `,` $amount (`device_id` $device_id^)? (`core_id` $core_id^)? (`subcore_id` $subcore_id^)? attr-dict `:` type($semaphore)
   }];
   let hasVerifier = 1;
   let extraClassDeclaration = [{
     mlir::tpu::CoreType getTargetCoreType();
   }];
+  let builders = [
+    // A backward-compatible builder that sets `subcore_id` to nullptr.
+    OpBuilder<(ins "Value":$semaphore, "Value":$amount, "Value":$device_id, "Value":$core_id)>,
+  ];
 }
 
 def TPU_BarrierOp : TPU_Op<"barrier"> {
@@ -1378,6 +1394,8 @@ def TPU_BarrierOp : TPU_Op<"barrier"> {
 // device_id         : The id of the device to copy to for remote DMAs.
 // core_id           : The id of the core to copy to for remote and cross-core
 //                     DMAs.
+// subcore_id        : The id of the subcore to copy to for remote and cross-core
+//                     DMAs, if applicable.
 // priority          : The priority of the DMA.
 // strict_ordering   : True if the DMA requires strict ordering. If false, the
 //                     ordering is either strict or relaxed depending on the
@@ -1390,6 +1408,7 @@ def TPU_EnqueueDMAOp : TPU_Op<"enqueue_dma", [AttrSizedOperandSegments]> {
     Optional<MemRefOf<[TPU_SomeSemaphoreType]>>:$target_semaphore,
     Optional<I32>:$device_id, // For remote DMAs
     Optional<I32>:$core_id,
+    Optional<I32>:$subcore_id,
     // Smaller number means higher priority. 0 is the highest and the default.
     DefaultValuedAttr<I32Attr, "0">:$priority,
     DefaultValuedAttr<BoolAttr, "false">:$strict_ordering
@@ -1401,12 +1420,17 @@ def TPU_EnqueueDMAOp : TPU_Op<"enqueue_dma", [AttrSizedOperandSegments]> {
     (`target_semaphore` `(` $target_semaphore^ `:` type($target_semaphore) `)`)?
     (`device_id` `(` $device_id^ `)`)?
     (`core_id` `(` $core_id^ `)`)?
+    (`subcore_id` `(` $subcore_id^ `)`)?
     attr-dict
   }];
   let hasVerifier = 1;
   let extraClassDeclaration = [{
     mlir::tpu::CoreType getTargetCoreType();
   }];
+  let builders = [
+    // A backward-compatible builder that sets `subcore_id` to nullptr.
+    OpBuilder<(ins "Value":$source, "Value":$source_semaphore, "Value":$target, "Value":$target_semaphore, "Value":$device_id, "Value":$core_id, CArg<"uint32_t", "0">:$priority, CArg<"bool", "false">:$strict_ordering)>,
+  ];
 }
 
 // A base class for all ops that need to differentiate between gather and
@@ -1462,14 +1486,7 @@ def TPU_EnqueueIndirectDMAOp : TPU_Op<"enqueue_indirect_dma">, IndirectDMAOp {
     attr-dict
   }];
   let hasVerifier = 1;
-  let extraClassDeclaration = extraBaseClassDeclaration # [{
-    LogicalResult verifyGather(MemRefType operand_ty,
-                               ArrayRef<int64_t> offsets_shape,
-                               MemRefType result_ty);
-    LogicalResult verifyScatter(MemRefType updates_ty,
-                                ArrayRef<int64_t> offsets_shape,
-                                MemRefType operand_ty);
-  }];
+  let extraClassDeclaration = extraBaseClassDeclaration;
 }
 
 // tpu.wait_dma2 waits for a DMA to complete.
@@ -1509,6 +1526,7 @@ def TPU_WaitDMAOp : TPU_Op<"wait_dma", [AttrSizedOperandSegments]> {
     Optional<MemRefOf<[TPU_SomeSemaphoreType]>>:$target_semaphore,
     Optional<I32>:$device_id, // For remote DMAs
     Optional<I32>:$core_id,
+    Optional<I32>:$subcore_id,
     DefaultValuedAttr<I32Attr, "0">:$priority,
     DefaultValuedAttr<BoolAttr, "false">:$strict_ordering,
     BoolAttr:$wait_target
@@ -1520,6 +1538,7 @@ def TPU_WaitDMAOp : TPU_Op<"wait_dma", [AttrSizedOperandSegments]> {
     (`target_semaphore` `(` $target_semaphore^ `:` type($target_semaphore) `)`)?
     (`device_id` `(` $device_id^ `)`)?
     (`core_id` `(` $core_id^ `)`)?
+    (`subcore_id` `(` $subcore_id^ `)`)?
     attr-dict
   }];
   let hasVerifier = 1;

@@ -136,6 +136,29 @@ def osp_linalg_fiedler(a: np.ndarray) -> np.ndarray:
   return np.vectorize(
       scipy.linalg.fiedler, signature="(n)->(n,n)", otypes=(a.dtype,))(a)
 
+def osp_linalg_fiedler_companion(a: np.ndarray) -> np.ndarray:
+  """Batched scipy fiedler_companion for testing."""
+  a = np.atleast_1d(a)
+  if scipy_version >= (1, 15):
+    return scipy.linalg.fiedler_companion(a)
+  out_dtype = np.result_type(a.dtype, np.float32)
+  return np.vectorize(
+      scipy.linalg.fiedler_companion, signature="(n)->(m,m)",
+      otypes=(out_dtype,))(a)
+
+def osp_linalg_convolution_matrix(a: np.ndarray, n: int,
+                                  mode: str = 'full') -> np.ndarray:
+  """Batched scipy convolution_matrix for testing."""
+  if scipy_version >= (1, 15):
+    return scipy.linalg.convolution_matrix(a, n, mode=mode)
+  a = np.atleast_1d(a)
+  if a.ndim == 1:
+    return scipy.linalg.convolution_matrix(a, n, mode=mode)
+  flat = a.reshape(-1, a.shape[-1])
+  out = np.stack([scipy.linalg.convolution_matrix(row, n, mode=mode)
+                  for row in flat])
+  return out.reshape(*a.shape[:-1], *out.shape[-2:])
+
 def osp_linalg_hankel(c: np.ndarray, r: np.ndarray | None = None) -> np.ndarray:
   """Batched scipy hankel for testing."""
   if scipy_version >= (1, 19):
@@ -2412,6 +2435,69 @@ class ScipyLinalgTest(jtu.JaxTestCase):
     self._CompileAndCheck(jsp.linalg.fiedler, args_maker)
 
   @jtu.sample_product(
+     shape=[(2,), (3,), (4,), (5,), (8,), (2, 3), (1, 2, 4)],
+     dtype=float_types,
+  )
+  def testFiedlerCompanion(self, shape, dtype):
+    rng = jtu.rand_nonzero(self.rng())
+    args_maker = lambda: [rng(shape, dtype)]
+    tol = {np.float32: 1e-5, np.float64: 1e-10}
+    self._CheckAgainstNumpy(osp_linalg_fiedler_companion,
+                            jsp.linalg.fiedler_companion, args_maker,
+                            atol=tol, rtol=tol, check_dtypes=False)
+    self._CompileAndCheck(jsp.linalg.fiedler_companion, args_maker)
+
+  @jtu.sample_product(shape=[(1,), (3, 1)])
+  def testFiedlerCompanionShortInput(self, shape):
+    # A single coefficient along the last axis yields an empty (..., 0, 0)
+    # companion matrix rather than an error, per the docstring.
+    a = jnp.ones(shape)
+    result = jsp.linalg.fiedler_companion(a)
+    self.assertEqual(result.shape, shape[:-1] + (0, 0))
+
+  @jtu.sample_product(shape=[(0,), (3, 0)])
+  def testFiedlerCompanionEmptyInput(self, shape):
+    # A zero-length last axis raises a clear ValueError rather than an
+    # IndexError from the implementation.
+    a = jnp.ones(shape)
+    with self.assertRaisesRegex(ValueError, "nonzero"):
+      jsp.linalg.fiedler_companion(a)
+
+  @jtu.sample_product(
+     m=[1, 2, 3, 5],
+     n=[1, 2, 3, 5, 7],
+     mode=['full', 'valid', 'same'],
+     batch=[(), (2,), (1, 3)],
+     # Integer dtypes are skipped because the underlying Toeplitz lowers via
+     # an integer convolution that CuDNN only supports for s8 inputs with f32
+     # bias on GPU.
+     dtype=float_types + complex_types,
+  )
+  def testConvolutionMatrix(self, m, n, mode, batch, dtype):
+    rng = jtu.rand_default(self.rng())
+    shape = (*batch, m)
+    args_maker = lambda: [rng(shape, dtype)]
+    osp_fun = partial(osp_linalg_convolution_matrix, n=n, mode=mode)
+    jsp_fun = partial(jsp.linalg.convolution_matrix, n=n, mode=mode)
+    self._CheckAgainstNumpy(osp_fun, jsp_fun, args_maker, check_dtypes=False)
+    self._CompileAndCheck(jsp_fun, args_maker)
+
+  def testConvolutionMatrixInvalidArgs(self):
+    a = jnp.array([1., 2., 3.])
+    with self.assertRaisesRegex(ValueError, "n must be a positive integer"):
+      jsp.linalg.convolution_matrix(a, 0)
+    with self.assertRaisesRegex(ValueError, "n must be a positive integer"):
+      jsp.linalg.convolution_matrix(a, -1)
+    with self.assertRaisesRegex(ValueError, "mode must be one of"):
+      jsp.linalg.convolution_matrix(a, 3, mode='bad')
+    with self.assertRaisesRegex(ValueError, r"len\(a\) must be at least 1"):
+      jsp.linalg.convolution_matrix(jnp.zeros((0,)), 3)
+    with self.assertRaisesRegex(ValueError, r"len\(a\) must be at least 1"):
+      jsp.linalg.convolution_matrix(jnp.zeros((2, 0)), 3)
+    with self.assertRaisesRegex(ValueError, "must be at least 1-dimensional"):
+      jsp.linalg.convolution_matrix(jnp.array(5.0), 3)
+
+  @jtu.sample_product(
     shape=[(2, 3), (4, 6), (50, 7), (100, 110)],
     dtype = float_types + complex_types,
     method = ["schur", "eigen"]
@@ -2718,6 +2804,19 @@ class LaxLinalgTest(jtu.JaxTestCase):
     self._CompileAndCheck(jsp_fun, args_maker)
 
   @jtu.sample_product(
+    n=[0, 1, 2, 3, 5, 8],
+    )
+  def testInvhilbert(self, n):
+    args_maker = lambda: []
+    osp_fun = lambda: osp.linalg.invhilbert(n, exact=False)
+    jsp_fun = partial(jsp.linalg.invhilbert, n=n)
+    self._CheckAgainstNumpy(osp_fun, jsp_fun, args_maker,
+                            atol=1e-3,
+                            rtol=1e-2 if jtu.test_device_matches(['tpu']) else 1e-3,
+                            check_dtypes=False)
+    self._CompileAndCheck(jsp_fun, args_maker)
+
+  @jtu.sample_product(
     n=[1, 2, 4, 8, 16],
     dtype=int_types + float_types,
   )
@@ -2822,6 +2921,25 @@ class LaxLinalgTest(jtu.JaxTestCase):
                             rtol=1e-2 if jtu.test_device_matches(['tpu']) else 1e-3,
                             check_dtypes=False)
     self._CompileAndCheck(jsp_fun, args_maker)
+
+  @jtu.sample_product(
+    n=[0, 1, 2, 5, 8],
+    kind=["symmetric", "lower", "upper"],
+  )
+  @jax.default_matmul_precision("float32")
+  def testInvpascal(self, n, kind):
+    args_maker = lambda: []
+    osp_fun = partial(osp.linalg.invpascal, n=n, kind=kind, exact=False)
+    jsp_fun = partial(jsp.linalg.invpascal, n=n, kind=kind)
+    self._CheckAgainstNumpy(osp_fun, jsp_fun, args_maker,
+                            atol=1e-3,
+                            rtol=1e-2 if jtu.test_device_matches(['tpu']) else 1e-3,
+                            check_dtypes=False)
+    self._CompileAndCheck(jsp_fun, args_maker)
+
+  def testInvpascalInvalidKind(self):
+    with self.assertRaisesRegex(ValueError, "Expected kind to be one of"):
+      jsp.linalg.invpascal(3, kind='bad')
 
 
 if __name__ == "__main__":

@@ -50,7 +50,6 @@ from jax._src.lax import utils as lax_utils
 from jax._src.sharding_impls import make_single_device_sharding
 from jax._src.util import safe_zip
 from jax._src.tree_util import tree_map
-from jax._src.lib import jaxlib_extension_version
 
 config.parse_flags_with_absl()
 
@@ -3856,8 +3855,6 @@ class LaxTest(jtu.JaxTestCase):
       jax.jacobian(f)(x, y)
 
   def test_dce_sink_prevents_xla_dce(self):
-    if jtu.is_cloud_tpu_at_least(2026, 4, 17):
-      self.skipTest('Requires nightly libtpu')
 
     x = jnp.array(1.0)
 
@@ -3877,7 +3874,6 @@ class LaxTest(jtu.JaxTestCase):
     hlo = jax.jit(g).lower(x).compile().as_text()
     self.assertNotIn("add", hlo)
 
-  @unittest.skipIf(jaxlib_extension_version < 441, "requires jaxlib 0.10.1")
   def testStagePreservesWeakType(self):
     aval = core.ShapedArray((), np.float32, weak_type=True)
     x = literals.TypedNdArray(np.array(1.0, dtype=np.float32), aval=aval)
@@ -4161,6 +4157,10 @@ class FooArray:
   size = property(lambda self: self.data.size // 2)
   ndim = property(lambda self: self.data.ndim - 1)
 
+
+dtypes.register_canonicalize_value_handler(FooArray, None)
+
+
 def shard_foo_array_handler(xs, shardings, layouts, copy_semantics):
   results = []
   for x, sharding in safe_zip(xs, shardings):
@@ -4202,7 +4202,6 @@ class CustomElementTypesTest(jtu.JaxTestCase):
   def setUp(self):
     core.pytype_aval_mappings[FooArray] = \
         lambda x: core.ShapedArray(x.shape, FooTy(), sharding=None)
-    dtypes.canonicalize_value_handlers[FooArray] = lambda x: x
     pxla.shard_arg_handlers[FooArray] = shard_foo_array_handler
     mlir._constant_handlers[FooArray] = foo_array_constant_handler
     mlir.register_lowering(make_p, mlir.lower_fun(make_lowering, False))
@@ -4214,7 +4213,6 @@ class CustomElementTypesTest(jtu.JaxTestCase):
 
   def tearDown(self):
     del core.pytype_aval_mappings[FooArray]
-    del dtypes.canonicalize_value_handlers[FooArray]
     del mlir._constant_handlers[FooArray]
     del mlir._lowerings[make_p]
     del mlir._lowerings[bake_p]
@@ -5122,13 +5120,10 @@ class RaggedTest(jtu.JaxTestCase):
             .as_text(dialect="stablehlo"),
         )
 
-  @unittest.skipIf(jaxlib_extension_version < 441,
-                   "Requires jaxlib_extension_version >= 441")
   def test_ragged_dot_general_preserves_named_scope(self):
     if not jtu.test_device_matches(["tpu"]):
       raise unittest.SkipTest("Test only runs on TPU")
-    if not jtu.is_cloud_tpu_at_least(2026, 4, 23):
-      raise unittest.SkipTest("Requires a newer libtpu")
+
 
 
     m, k, n = (8, 8, 8)

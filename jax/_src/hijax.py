@@ -186,7 +186,7 @@ class MutableHiType(core.AbstractValue):
 
 def register_hitype(val_cls, typeof_fn) -> None:
   core.pytype_aval_mappings[val_cls] = typeof_fn
-  dtypes.canonicalize_value_handlers[val_cls] = lambda x: x
+  dtypes.register_canonicalize_value_handler(val_cls, None)
 
 def hijax_method(f):
   return core.aval_method(f)
@@ -211,7 +211,7 @@ def box_set(box, val):
 
 ## Box implementation
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BoxTypeState(QDD):
   leaf_avals: tuple[core.AbstractValue, ...]
   treedef: PyTreeDef
@@ -644,6 +644,12 @@ def _call_hi_primitive_linearized_transpose(cts_flat, *args, _prim,
   assert none is None
 ad.fancy_transposes[call_hi_primitive_linearized_p] = _call_hi_primitive_linearized_transpose
 
+def _call_hi_primitive_linearized_prettyprint(eqn, context, settings):
+  params = dict(eqn.params, _prim=str(eqn.params['_prim'].__class__),
+                residuals_tree='...')
+  return core._pp_eqn(eqn.replace(params=params), context, settings)
+core.pp_eqn_rules[call_hi_primitive_linearized_p] = _call_hi_primitive_linearized_prettyprint
+
 def _call_hi_primitive_jvp(primals, tangents, *, _prim):
   primals = tree_unflatten(_prim.in_tree, primals)
   tangents = tree_unflatten(_prim.in_tree, tangents)
@@ -900,7 +906,7 @@ def _set_up_nondiff(f, argnums_, argnames) -> frozenset[int]:
   return frozenset(argnums)
 
 @register_static
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Static:
   val: Any
 

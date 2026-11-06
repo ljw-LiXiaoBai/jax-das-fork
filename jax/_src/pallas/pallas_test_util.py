@@ -14,11 +14,9 @@
 """Pallas test utilities."""
 import sys
 
+from jax._src import config
 from jax._src import test_util as jtu
-from jax._src.pallas import pallas_call
-from jax.experimental import pallas as pl
-
-use_mosaic_gpu = pallas_call._PALLAS_USE_MOSAIC_GPU.value
+from jax._src.pallas import pallas_call as pl_lib
 
 
 @jtu.with_config(jax_traceback_filtering="off")
@@ -35,7 +33,8 @@ class PallasTest(jtu.JaxTestCase):
       if (jtu.test_device_matches(["cuda"]) and
           not jtu.is_cuda_compute_capability_at_least("8.0")):
         self.skipTest("Only works on GPU with capability >= sm80")
-      if (jtu.test_device_matches(["cuda"]) and use_mosaic_gpu and
+      if (jtu.test_device_matches(["cuda"]) and
+          config.jax_pallas_use_mosaic_gpu.value and
           not jtu.is_cuda_compute_capability_at_least("9.0")):
         self.skipTest("Mosaic GPU requires capability >= sm90")
       if sys.platform == "win32":
@@ -43,7 +42,7 @@ class PallasTest(jtu.JaxTestCase):
     super().setUp()
 
   def pallas_call(self, *args, **kwargs):
-    return pl.pallas_call(*args, **kwargs, interpret=self.INTERPRET)
+    return pl_lib.pallas_call(*args, **kwargs, interpret=self.INTERPRET)
 
 
 class PallasTPUTest(PallasTest):

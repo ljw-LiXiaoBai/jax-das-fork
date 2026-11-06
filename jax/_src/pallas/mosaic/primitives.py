@@ -24,7 +24,7 @@ from jax._src import core as jax_core
 from jax._src import dtypes
 from jax._src import effects
 from jax._src import pretty_printer as pp
-from jax._src import prng as jax_prng
+from jax._src.random import prng as jax_prng
 from jax._src import random as jax_random
 from jax._src import state
 from jax._src import tree_util
@@ -102,6 +102,13 @@ def _bitcast_lowering_rule(ctx: mlir.LoweringRuleContext, x, *, ty):
 
 
 mlir.register_lowering(bitcast_p, _bitcast_lowering_rule)
+
+
+def _bitcast_batch_rule(batched_args, batch_axes, *, ty):
+  return bitcast(*batched_args, ty=ty), batch_axes[0]
+
+batching.primitive_batchers[bitcast_p] = _bitcast_batch_rule
+
 
 roll_p = jax_core.Primitive("roll")
 
@@ -911,6 +918,27 @@ pack_elementwise_p = jax_core.Primitive("pack_elementwise")
 
 
 def pack_elementwise(xs, *, packed_dtype):
+  """Packs multiple arrays elementwise into a single array of a narrower dtype.
+
+  The number of `xs` must equal the packing factor, which is the ratio of
+  the element bitwidth of the `xs` to the element bitwidth of the
+  `packed_dtype`. Elements from the `xs` are interleaved and packed into
+  the `output`, ordered from lowest to highest bits, corresponding to their
+  order in the `xs`.  The `output` is then bitcasted to the signless
+  integer type of the same bitwidth as the `xs`.
+
+  Note that for integer packing, the bits in `xs` that exceed the
+  bitwidth of the `packed_type` are just truncated.
+  For example, given the `xs` are int8 xxxx'1001 and yyyy'0011,
+  `packed_type` is int4, the output will be 0011'1001.
+
+  Args:
+    xs: A list of arrays to pack.
+    packed_dtype: The dtype of the packed array.
+
+  Returns:
+    The packed array.
+  """
   return pack_elementwise_p.bind(*xs, packed_dtype=packed_dtype)
 
 
@@ -945,15 +973,56 @@ unpack_elementwise_p = jax_core.Primitive("unpack_elementwise")
 
 
 def unpack_elementwise(x, *, index, packed_dtype, unpacked_dtype):
+  """Unpacks an elementwise packed array.
+
+  The function follows the *interleaved format* during unpacking, and it's the
+  reverse of `pack_elementwise`.
+
+  For example, if `packed_dtype` is `int4`, `unpacked_dtype` is `int8`,
+  and `x` is packed `int8` with x'y'z'w'm'n'i'j' in a word, where each
+  character represents 4 bits:
+
+  When `index=0`, the result is a packed i8 with s_y'y's_w'w's_n'n's_j'j';
+  When `index=1`, the result is a packed i8 with s_x'x's_z'z's_m'm's_i'i'.
+  With `s_x` indicating the MSB of `x`, and so on.
+
+  For logical array, this unpacking results in a strided access pattern.
+  For example, if a 2D logical array `x` is packed as `int8` and unpacked to
+  `int16`, then
+
+  ```python
+  i8_x = pltpu.bitcast(i16_x, jnp.int8)
+  y = unpack_elementwise(
+      i16_x, index=0, packed_dtype=jnp.int8, unpacked_dtype=jnp.int16)
+  z = unpack_elementwise(
+      i16_x, index=1, packed_dtype=jnp.int8, unpacked_dtype=jnp.int16)
+  np.testing.assert_array_equal(y, i8_x[0::2, :].astype(jnp.int16))
+  np.testing.assert_array_equal(z, i8_x[1::2, :].astype(jnp.int16))
+  ```
+
+  Args:
+    x: The packed array.
+    index: The index of the element to unpack.
+    packed_dtype: Elements
+    unpacked_dtype: The dtype of the unpacked array.
+
+  Returns:
+    The unpacked array in `unpacked_dtype`.
+  """
   return unpack_elementwise_p.bind(
       x, index=index, packed_dtype=packed_dtype, unpacked_dtype=unpacked_dtype
   )
 
 
 @unpack_elementwise_p.def_abstract_eval
-def _unpack_elementwise_abstract_eval(x, *, index, packed_dtype, unpacked_dtype):
-  if x.dtype != jnp.uint32:
-    raise ValueError(f"Source must be uint32, got {x.dtype}")
+def _unpack_elementwise_abstract_eval(
+    x, *, index, packed_dtype, unpacked_dtype
+):
+  if dtypes.itemsize_bits(x.dtype) != dtypes.itemsize_bits(unpacked_dtype):
+    raise ValueError(
+        "The bitwidth of `x` must match the bitwidth of `unpacked_dtype` for "
+        f"unpack_elementwise, but got {x.dtype} and {unpacked_dtype}"
+    )
   packing_factor = _get_elementwise_packing_factor(unpacked_dtype, packed_dtype)
   if index < 0 or index >= packing_factor:
     raise ValueError(

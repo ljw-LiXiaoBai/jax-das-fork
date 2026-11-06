@@ -343,12 +343,21 @@ def _scatter_lowering_rule(
 ):
   ref, transforms, indices, x, mask = jax.tree.unflatten(tree, flat_args)
   ref_aval, *_ = tree.unflatten(ctx.avals_in)
-  if ref_aval.memory_space not in (
+  if isinstance(ref_aval.memory_space, pallas_core.CoreMemorySpace):
+    if not isinstance(ref_aval.memory_space.mesh, sc_core.VectorSubcoreMesh):
+      raise ValueError(
+          "Scatter only supports VectorSubcoreMesh, got"
+          f" {type(ref_aval.memory_space.mesh)}"
+      )
+    memory_space = ref_aval.memory_space.memory_space
+  else:
+    memory_space = ref_aval.memory_space
+  if memory_space not in (
       tpu_core.MemorySpace.VMEM,
       pallas_core.MemorySpace.DEFAULT,
   ):
     raise ValueError(
-        f"Scatter only supports storing to VMEM, got {ref_aval.memory_space}"
+        f"Scatter only supports storing to VMEM, got {memory_space}"
     )
   if transforms:
     ref_block_shape, *_ = ctx.block_shapes
@@ -759,11 +768,11 @@ def _parallel_loop_abstract_eval(*args, jaxpr, tree, **params):
   if any(isinstance(c, (Ref, TransformedRef)) for c in carries):
     raise TypeError(f"Carried values may not be refs, but got: {carries}")
   updated_effects = set()
-  for eff in jaxpr.effects:
+  for eff in jax_core.positional_effects(jaxpr):
     if isinstance(eff, effects.JaxprInputEffect):
       # Offset for the parallel_loop eqn to account for start, stop, and step
       # args passed to parallel_loop_p.bind.
-      eff = eff.replace(input_index=eff.input_index + 3)
+      eff = eff.replace(eff.input + 3)
     updated_effects.add(eff)
   return carries, updated_effects
 

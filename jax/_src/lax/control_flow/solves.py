@@ -23,7 +23,6 @@ from jax._src import api
 from jax._src import api_util
 from jax._src import core
 from jax._src import custom_derivatives
-from jax._src import linear_util as lu
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
@@ -160,9 +159,8 @@ def _root_jvp(const_lengths, jaxprs, primals, tangents):
   linearize_and_solve = partial(
       core.jaxpr_as_fun(jaxprs.l_and_s), *params.l_and_s)
   f_at_solution = lambda *params: f(*params, *solution)
-  _, rhs = ad.jvp(lu.wrap_init(f_at_solution,
-                               debug_info=jaxprs.f.jaxpr.debug_info)).call_wrapped(
-      params.f, params_dot.f)
+  _, rhs = ad.jvp(f_at_solution, FlatTree.flatten_list(params.f),
+                  FlatTree.flatten_list(params_dot.f))
   solution_dot = _map(
       operator.neg, linearize_and_solve(*solution, *rhs))
   # append aux, create symbolic zero tangents for the aux values
@@ -356,9 +354,10 @@ def _tangent_linear_map(func: Callable, params, params_dot,
   """
   assert any(type(p) is not ad_util.Zero for p in params_dot)
   zeros = _map(ad_util.p2tz, x)
-  _, out_tangent = ad.jvp(lu.wrap_init(func, debug_info=debug_info)).call_wrapped(
-      params + list(x), params_dot + zeros)
-  return out_tangent
+  primals_ft = FlatTree.flatten_list(params + list(x))
+  tangents_ft = FlatTree.flatten_list(params_dot + zeros)
+  _, out_tangent = ad.jvp(func, primals_ft, tangents_ft)
+  return list(out_tangent)
 
 
 def _custom_linear_solve_jvp(primals, tangents, const_lengths, jaxprs):
@@ -421,7 +420,7 @@ def _linear_solve_transpose_rule(cotangent, *primals, const_lengths, jaxprs):
 
 
 def _linear_solve_batching_rule(axis_data, args, dims, const_lengths, jaxprs):
-  orig_bat = [d is not batching.not_mapped for d in dims]
+  orig_bat = [d is not None for d in dims]
 
   params, b = _split_linear_solve_args(args, const_lengths)
   params_dims, b_dims = _split_linear_solve_args(dims, const_lengths)
@@ -479,7 +478,7 @@ def _linear_solve_batching_rule(axis_data, args, dims, const_lengths, jaxprs):
   # Move batched axes to the front
   new_params = [
       batching.moveaxis(x, d, 0)
-      if d is not batching.not_mapped and d != 0 else x
+      if d is not None and d != 0 else x
       for x, d in zip(_flatten(params), _flatten(params_dims))
   ]
   # Broadcast out b if necessary
@@ -494,7 +493,7 @@ def _linear_solve_batching_rule(axis_data, args, dims, const_lengths, jaxprs):
       *(new_params + new_b),
       const_lengths=const_lengths,
       jaxprs=batched_jaxprs)
-  out_dims = [0 if batched else batching.not_mapped for batched in solve_x_bat]
+  out_dims = [0 if batched else None for batched in solve_x_bat]
   return outs, out_dims
 
 

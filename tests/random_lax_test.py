@@ -31,11 +31,12 @@ from jax import random
 from jax._src import config
 from jax._src import core
 from jax._src import dtypes
-from jax._src.random import _safe_int_to_float, _check_broadcast_shapes
+from jax._src.random.core import _safe_int_to_float, _check_broadcast_shapes
 from jax._src import test_util as jtu
 from jax import vmap
 
-from jax._src import prng as prng_internal
+from jax._src.random import prng as prng_internal
+from jax._src.random import threefry2x32 as threefry2x32_internal
 
 config.parse_flags_with_absl()
 
@@ -224,7 +225,10 @@ _OUT_SHARDING_CASES = [
     ('dirichlet', lambda key, n, s: random.dirichlet(key, jnp.ones(3), shape=(n,), out_sharding=s)),
     ('exponential', lambda key, n, s: random.exponential(key, shape=(n,), out_sharding=s)),
     ('f', lambda key, n, s: random.f(key, dfnum=2.0, dfden=3.0, shape=(n,), out_sharding=s)),
+    ('generalized_normal', lambda key, n, s: random.generalized_normal(key, 0.5, shape=(n,), out_sharding=s)),
+    ('geometric', lambda key, n, s: random.geometric(key, p=0.5, shape=(n,), out_sharding=s)),
     ('gumbel', lambda key, n, s: random.gumbel(key, shape=(n,), out_sharding=s)),
+    ('maxwell', lambda key, n, s: random.maxwell(key, shape=(n,), out_sharding=s)),
     ('multivariate_normal', lambda key, n, s: random.multivariate_normal(key, mean=jnp.zeros((n,)), cov=jnp.eye(n), shape=(n,), out_sharding=s)),
     ('laplace', lambda key, n, s: random.laplace(key, shape=(n,), out_sharding=s)),
     ('loggamma', lambda key, n, s: random.loggamma(key, a=2.0, shape=(n,), out_sharding=s)),
@@ -240,6 +244,7 @@ _OUT_SHARDING_CASES = [
     ('rayleigh', lambda key, n, s: random.rayleigh(key, shape=(n,), scale=0.5, out_sharding=s)),
     ('t', lambda key, n, s: random.t(key, df=10.0, shape=(n,), out_sharding=s)),
     ('truncated_normal', lambda key, n, s: random.truncated_normal(key, lower=-2., upper=2., shape=(n,), out_sharding=s)),
+    ('triangular', lambda key, n, s: random.triangular(key, left=0., mode=0.5, right=1., shape=(n,), out_sharding=s)),
     ('uniform', lambda key, n, s: random.uniform(key, shape=(n,), out_sharding=s)),
     ('gamma', lambda key, n, s: random.gamma(key, a=2.0, shape=(n,), out_sharding=s)),
     ('wald', lambda key, n, s: random.wald(key, mean=1.0, shape=(n,), out_sharding=s)),
@@ -265,6 +270,93 @@ class RandomOutShardingTest(RandomTestBase):
       jit_result = jax.jit(fn, static_argnums=(1, 2))(key, n, sharding)
     self.assertTrue(result.sharding.is_equivalent_to(sharding, result.ndim))
     self.assertTrue(result.sharding.is_equivalent_to(sharding, jit_result.ndim))
+
+_DTYPE_CASES = [
+    ('beta', float, lambda key, dtype: random.beta(key, np.float16(0.5), np.float16(0.5), shape=(10,), dtype=dtype)),
+    ('binomial', float, lambda key, dtype: random.binomial(key, np.float16(10.), np.float16(0.5), shape=(10,), dtype=dtype)),
+    ('chisquare', float, lambda key, dtype: random.chisquare(key, np.float16(2.0), shape=(10,), dtype=dtype)),
+    ('dirichlet', float, lambda key, dtype: random.dirichlet(key, np.ones(3, np.float16), shape=(10,), dtype=dtype)),
+    ('double_sided_maxwell', float, lambda key, dtype: random.double_sided_maxwell(key, loc=np.float16(0.), scale=np.float16(1.), shape=(10,), dtype=dtype)),
+    ('f', float, lambda key, dtype: random.f(key, np.float16(2.0), np.float16(2.0), shape=(10,), dtype=dtype)),
+    ('gamma', float, lambda key, dtype: random.gamma(key, np.float16(2.0), shape=(10,), dtype=dtype)),
+    ('geometric', int, lambda key, dtype: random.geometric(key, np.float16(0.5), shape=(10,), dtype=dtype)),
+    ('loggamma', float, lambda key, dtype: random.loggamma(key, np.float16(2.0), shape=(10,), dtype=dtype)),
+    ('lognormal', float, lambda key, dtype: random.lognormal(key, np.float16(1.0), shape=(10,), dtype=dtype)),
+    ('pareto', float, lambda key, dtype: random.pareto(key, np.float16(3.0), shape=(10,), dtype=dtype)),
+    ('poisson', int, lambda key, dtype: random.poisson(key, np.float16(3.0), shape=(10,), dtype=dtype)),
+    ('randint', int, lambda key, dtype: random.randint(key, shape=(10,), minval=np.int32(0), maxval=np.int32(10), dtype=dtype)),
+    ('rayleigh', float, lambda key, dtype: random.rayleigh(key, np.float16(0.5), shape=(10,), dtype=dtype)),
+    ('t', float, lambda key, dtype: random.t(key, np.float16(10.0), shape=(10,), dtype=dtype)),
+    ('triangular', float, lambda key, dtype: random.triangular(key, np.float16(0.), np.float16(0.5), np.float16(1.), shape=(10,), dtype=dtype)),
+    ('truncated_normal', float, lambda key, dtype: random.truncated_normal(key, lower=np.float16(-2.), upper=np.float16(2.), shape=(10,), dtype=dtype)),
+    ('uniform', float, lambda key, dtype: random.uniform(key, shape=(10,), minval=np.float16(0.), maxval=np.float16(1.), dtype=dtype)),
+    ('wald', float, lambda key, dtype: random.wald(key, np.float16(1.0), shape=(10,), dtype=dtype)),
+    ('weibull_min', float, lambda key, dtype: random.weibull_min(key, np.float16(1.0), np.float16(1.0), shape=(10,), dtype=dtype)),
+]
+
+def expand_dtype_cases(cases):
+  for (name, abstract_type, func) in cases:
+    to_test = {int: int_dtypes + uint_dtypes, float: float_dtypes}
+    sampled_types = jtu.sample_product_testcases(dtype=to_test[abstract_type])
+    for dtype_dict in sampled_types:
+      dtype = dtype_dict['dtype']
+      yield (f"{name}_{dtype}", abstract_type, dtype, func)
+
+class RandomDtypeTest(RandomTestBase):
+  """Tests that dtype arguments are obeyed for jax.random functions."""
+
+  @parameterized.named_parameters(expand_dtype_cases(_DTYPE_CASES))
+  @jax.numpy_dtype_promotion('standard')
+  def test_dtype(self, abstract_type, dtype, fn):
+    key = random.key(0)
+    jitted = jax.jit(fn, static_argnums=(1,))
+    if dtypes.safe_to_cast(np.float16, dtype):
+      result = fn(key, dtype)
+      self.assertEqual(result.dtype, dtype)
+      jit_result = jitted(key, dtype)
+      self.assertEqual(jit_result.dtype, dtype)
+    elif abstract_type is float:
+      pass
+      # No samplers currently do this, but they should!
+      # self.assertRaises(dtypes.TypePromotionError, fn, key, dtype)
+      # self.assertRaises(dtypes.TypePromotionError, jitted, key, dtype)
+
+
+_SHAPE_CASES = [
+    ('beta', lambda key, shape: random.beta(key, jnp.ones(shape), jnp.ones(shape), shape=shape)),
+    ('binomial', lambda key, shape: random.binomial(key, jnp.full(shape, 10.), jnp.full(shape, 0.5), shape=shape)),
+    ('chisquare', lambda key, shape: random.chisquare(key, jnp.ones(shape), shape=shape)),
+    # ('double_sided_maxwell', lambda key, shape: random.double_sided_maxwell(key, loc=jnp.zeros(shape), scale=jnp.ones(shape), shape=shape)),
+    ('f', lambda key, shape: random.f(key, jnp.ones(shape), jnp.ones(shape), shape=shape)),
+    ('gamma', lambda key, shape: random.gamma(key, jnp.ones(shape), shape=shape)),
+    ('geometric', lambda key, shape: random.geometric(key, jnp.full(shape, 0.5), shape=shape)),
+    ('loggamma', lambda key, shape: random.loggamma(key, jnp.ones(shape), shape=shape)),
+    ('lognormal', lambda key, shape: random.lognormal(key, jnp.ones(shape), shape=shape)),
+    ('pareto', lambda key, shape: random.pareto(key, jnp.ones(shape), shape=shape)),
+    ('poisson', lambda key, shape: random.poisson(key, jnp.ones(shape), shape=shape)),
+    ('randint', lambda key, shape: random.randint(key, shape=shape, minval=jnp.zeros(shape, jnp.int32), maxval=jnp.full(shape, 10, jnp.int32))),
+    ('rayleigh', lambda key, shape: random.rayleigh(key, jnp.ones(shape), shape=shape)),
+    ('t', lambda key, shape: random.t(key, jnp.ones(shape), shape=shape)),
+    ('triangular', lambda key, shape: random.triangular(key, jnp.zeros(shape), jnp.full(shape, 0.5), jnp.ones(shape), shape=shape)),
+    ('truncated_normal', lambda key, shape: random.truncated_normal(key, lower=jnp.full(shape, -2.), upper=jnp.full(shape, 2.), shape=shape)),
+    ('uniform', lambda key, shape: random.uniform(key, shape=shape, minval=jnp.zeros(shape), maxval=jnp.ones(shape))),
+    ('wald', lambda key, shape: random.wald(key, jnp.ones(shape), shape=shape)),
+    ('weibull_min', lambda key, shape: random.weibull_min(key, jnp.ones(shape), jnp.ones(shape), shape=shape)),
+]
+
+
+class RandomShapeTest(RandomTestBase):
+  """Tests that shape arguments are obeyed for jax.random functions."""
+
+  @parameterized.named_parameters(_SHAPE_CASES)
+  def test_shape(self, fn):
+    key = random.key(0)
+    shape = (3, 4)
+    result = fn(key, shape)
+    self.assertEqual(result.shape, shape)
+    jit_result = jax.jit(fn, static_argnums=(1,))(key, shape)
+    self.assertEqual(jit_result.shape, shape)
+
 
 class DistributionsTest(RandomTestBase):
   """
@@ -1519,6 +1611,16 @@ class DistributionsTest(RandomTestBase):
     counts = jnp.bincount(data, length=n_bins).astype(float)
     self._CheckKolmogorovSmirnovCDF(counts, scipy.stats.poisson(n_samples / n_bins).cdf)
 
+  def test_geometric_avoids_infs(self):
+    # Regression test for https://github.com/jax-ml/jax/issues/38007
+    key = random.key(0)
+    # Sample at bfloat16 so that there are only 2^7 distinct values,
+    # and sample 2^8 points so we are likely to cover the whole space.
+    p = jnp.bfloat16(0.1)
+    vals = random.geometric(key, p, shape=(256,))
+    self.assertFalse(np.any(vals == jnp.iinfo(vals.dtype).max),
+                     "geometric sampler produced an infinity.")
+
 
 def get_energy_distance(samples_1, samples_2):
   """
@@ -1535,10 +1637,10 @@ def get_energy_distance(samples_1, samples_2):
   ).mean(0)
 
 
-threefry_seed = prng_internal.threefry_seed
-threefry_split = prng_internal.threefry_split
-threefry_random_bits = prng_internal.threefry_random_bits
-threefry_fold_in = prng_internal.threefry_fold_in
+threefry_seed = threefry2x32_internal.threefry_seed
+threefry_split = threefry2x32_internal.threefry_split
+threefry_random_bits = threefry2x32_internal.threefry_random_bits
+threefry_fold_in = threefry2x32_internal.threefry_fold_in
 
 def _double_threefry_seed(seed):
   int_t = seed.dtype.type if hasattr(seed, 'dtype') else type(seed)
@@ -1659,7 +1761,7 @@ class RBGPRNGTest(CommonRandomTest):
     self.assertEqual(out.shape, keys.shape)
 
   @jax.debug_key_reuse(False)
-  def test_vmap_split_not_mapped_key(self):
+  def test_vmap_split_unmapped_key(self):
     key = self.make_key(73)
     single_split_key = random.split(key)
     vmapped_keys = vmap(lambda _: random.split(key))(jnp.zeros(3,))

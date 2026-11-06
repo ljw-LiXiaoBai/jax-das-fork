@@ -44,6 +44,7 @@ from jax._src.interpreters import partial_eval
 from jax._src.interpreters import pxla
 from jax._src.api_util import InternalFloatingPointError
 from jax._src.layout import Layout, Format
+from jax._src.lib import _jax
 from jax._src.lib import xla_client as xc
 from jax._src.mesh import AbstractMesh, Mesh
 from jax._src.monitoring import record_scalar, record_event_duration_secs, record_event_time_span
@@ -61,9 +62,7 @@ BACKEND_COMPILE_EVENT = "/jax/core/compile/backend_compile_duration"
 
 traceback_util.register_exclusion(__file__)
 
-xe = xc._xla
-
-Backend = xe.Client
+Backend = _jax.Client
 Device = xc.Device
 ArrayCopySemantics = xc.ArrayCopySemantics
 
@@ -392,7 +391,7 @@ def _is_supported_cross_host_transfer(ndim, src_sharding, dst_sharding):
         "DCN-based cross host device transfers.")
   return different_process_inds
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class _DeferredShardArg:
   """Deferred call to `pxla.shard_args`.
 
@@ -411,7 +410,7 @@ class _DeferredShardArg:
     return pxla.global_aval_to_result_handler(
         self.aval, self.s, self.committed)(shard_arg_result)
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class _DeferredCrossHostTransferArg:
   """Deferred call to `xc.batched_copy_array_to_devices_with_sharding` for
   cross-host data transfers.
@@ -690,7 +689,7 @@ def _device_put_transpose(cts, *args, devices, srcs, copy_semantics):
       cts, args, devices, srcs, copy_semantics)):
     if ad.is_undefined_primal(arg):
       if type(ct) is ad.Zero:
-        results[i] = ad.Zero(arg.aval.to_ct_aval())
+        results[i] = ad.Zero(arg.aval)
       else:
         dp_cts.append((i, ct, arg, device, src, cp))
 
@@ -720,7 +719,7 @@ ad.primitive_jvps[device_put_p] = partial(ad.linear_jvp, device_put_p)
 ad.primitive_transposes[device_put_p] = _device_put_transpose
 
 def _device_put_batcher(batched_args, batch_dims, **params):
-  mapped_batch_dims = [bd for bd in batch_dims if bd is not batching.not_mapped]
+  mapped_batch_dims = [bd for bd in batch_dims if bd is not None]
   assert not mapped_batch_dims or all(
       mapped_batch_dims[0] == bd for bd in mapped_batch_dims[1:]
   ), batch_dims

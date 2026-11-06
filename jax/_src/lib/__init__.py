@@ -17,12 +17,13 @@
 
 from __future__ import annotations
 
-import importlib
 import gc
+import importlib
 import os
 import pathlib
 import re
 from types import ModuleType
+from typing import TYPE_CHECKING
 
 
 try:
@@ -99,6 +100,10 @@ import jaxlib.lapack as lapack  # noqa: F401
 import jaxlib.utils as utils  # noqa: F401
 import jaxlib._jax as _jax  # noqa: F401
 
+try:
+  import jaxlib._xla as _xla  # noqa: F401
+except ImportError:
+  _xla = None
 
 
 import jaxlib.mlir._mlir_libs._jax_mlir_ext as jax_mlir_ext  # noqa: F401
@@ -117,10 +122,15 @@ import jaxlib._pretty_printer as _pretty_printer  # noqa: F401
 
 import jaxlib._ifrt_proxy as ifrt_proxy  # noqa: F401
 
+if jaxlib_extension_version >= 457 or TYPE_CHECKING:
+  from jaxlib import _hlo as hlo  # noqa: F401
+else:
+  hlo = _jax
+
 
 # XLA garbage collection: see https://github.com/jax-ml/jax/issues/14882
 def _xla_gc_callback(*args):
-  xla_client._xla.collect_garbage()
+  _jax.collect_garbage()
 gc.callbacks.append(_xla_gc_callback)
 
 cuda_versions: ModuleType | None

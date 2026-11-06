@@ -34,6 +34,7 @@ from jax._src import mesh_utils
 from jax._src.mesh import (
     Mesh, AbstractMesh, AxisType, empty_abstract_mesh, empty_concrete_mesh,
     get_abstract_mesh, get_concrete_mesh)
+from jax._src.lib import _jax
 from jax._src.lib import xla_client as xc
 from jax._src.lib.mlir.dialects import sdy
 from jax._src.named_sharding import (  # noqa: F401
@@ -49,7 +50,7 @@ from jax._src.util import use_cpp_class, use_cpp_method
 import numpy as np
 
 
-config_ext = xc._xla.config
+config_ext = _jax.config
 
 Shape = tuple[int, ...]
 Device = xc.Device
@@ -84,7 +85,7 @@ def device_replica_id_map(sharding, global_shape: Shape) -> Mapping[Device, int]
   return out
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class SdyArrayList:
   shardings: tuple[SdyArray, ...]
 
@@ -209,6 +210,9 @@ class GSPMDSharding(jsharding.Sharding):
     self._hlo_sharding = (xc.HloSharding.from_proto(op_sharding)
                           if isinstance(op_sharding, xc.OpSharding) else
                           op_sharding)
+    # Convert HloShardingV3 to V2 as JAX expects tiled sharding for shardings
+    # returned by XLA.
+    self._hlo_sharding = xc.HloSharding.v3_to_v2_sharding(self._hlo_sharding)
     self._memory_kind = memory_kind
 
   def __reduce__(self):
@@ -324,7 +328,7 @@ def prepare_axis_resources(axis_resources, arg_name,
         raise ValueError(f'One of {what} got an empty NamedSharding: {entry} '
                          'which is not allowed.')
       if (not allow_unconstrained_dims and isinstance(entry, NamedSharding) and
-          PartitionSpec.UNCONSTRAINED in entry.spec):
+          PartitionSpec.UNCONSTRAINED in entry.spec.partitions):
         raise ValueError(
             f'Unconstrained dims are not allowed when passed to {arg_name}:'
             f' {entry}')
@@ -333,7 +337,8 @@ def prepare_axis_resources(axis_resources, arg_name,
       if not isinstance(entry, PartitionSpec):
         raise TypeError(f"{what} are expected to be "
                         f"PartitionSpec instances or None, but got {entry}")
-      if not allow_unconstrained_dims and PartitionSpec.UNCONSTRAINED in entry:
+      if (not allow_unconstrained_dims and
+          PartitionSpec.UNCONSTRAINED in entry.partitions):
         raise ValueError(
             f'Unconstrained dims are not allowed when passed to {arg_name}:'
             f' {entry}')
@@ -344,7 +349,7 @@ def prepare_axis_resources(axis_resources, arg_name,
 
 # Axis environments
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class SPMDAxisContext:
   """A hardware axis context for parallel computations that use the GSPMD partitioner.
 
@@ -356,7 +361,7 @@ class SPMDAxisContext:
   manual_axes: frozenset[MeshAxisName] = frozenset()
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class ShardingContext:
   """A hardware axis context for parallel computations that use the sharding
   interface.
@@ -960,8 +965,7 @@ def make_mesh(axis_shapes: Sequence[int], axis_names: Sequence[str],
   mesh_devices = mesh_utils.create_device_mesh(
       new_axis_shapes, devices,
       allow_split_physical_axes=allow_split_physical_axes)
-  first_d = mesh_devices.flat[0]
-  if (first_d.platform == 'tpu' and hasattr(first_d, 'slice_index') and
+  if (hasattr(mesh_devices.flat[0], 'slice_index') and
       len({d.slice_index for d in mesh_devices.flat}) > 1):
     raise ValueError(
         '`jax.make_mesh` does not support multi-slice topologies. Please use'

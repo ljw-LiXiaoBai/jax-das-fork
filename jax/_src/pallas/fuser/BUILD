@@ -14,6 +14,7 @@
 
 load(
     "//jaxlib:jax.bzl",
+    "jax_visibility",
     "py_deps",
     "pytype_strict_library",
 )
@@ -47,6 +48,9 @@ pytype_strict_library(
         "block_spec.py",
     ],
     type_checking = "pyrefly",
+    visibility = [
+        "//jax:internal",
+    ] + jax_visibility("pallas/fuser/block_spec"),
     deps = [
         ":fuser_utils",
         "//jax",
@@ -128,12 +132,14 @@ pytype_strict_library(
     ],
     type_checking = "pyrefly",
     deps = [
+        ":fuser_utils",
         ":fusible",
         ":fusible_dtype",
         ":fusion",
         "//jax",
         "//jax/_src:api_util",
         "//jax/_src:core",
+        "//jax/_src:lax",
         "//jax/_src:partial_eval",
         "//jax/_src:traceback_util",
         "//jax/_src:tree_util",
@@ -147,6 +153,9 @@ pytype_strict_library(
         "fusible_dtype.py",
     ],
     type_checking = "pyrefly",
+    visibility = [
+        "//jax:internal",
+    ] + jax_visibility("pallas/fuser/fusible_dtype"),
     deps = [
         ":block_spec",
         ":fusible",
@@ -185,6 +194,8 @@ pytype_strict_library(
     deps = [
         "//jax/_src:api_util",
         "//jax/_src:core",
+        "//jax/_src:effects",
+        "//jax/_src:lax",
         "//jax/_src:partial_eval",
         "//jax/_src:tree_util",
     ] + py_deps("numpy"),

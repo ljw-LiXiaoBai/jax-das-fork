@@ -121,6 +121,7 @@ Operators
     max
     min
     mul
+    mulhi
     ne
     neg
     nextafter
@@ -236,6 +237,7 @@ Parallel operators
     axis_size
     psend
     precv
+    pbroadcast
 
 Sharding-related operators
 --------------------------

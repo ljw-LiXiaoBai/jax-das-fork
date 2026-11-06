@@ -698,6 +698,8 @@ def run_scoped(
       t.ref if isinstance(t, state_types.TransformedRef) else t
       for t in ref_avals
   ]
+  # Note that only a subset of all transforms can be found here, and they are
+  # never expected to contain any arrays.
   ref_transforms = tuple(
       t.transforms if isinstance(t, state_types.TransformedRef) else ()
       for t in ref_avals
@@ -710,24 +712,28 @@ def run_scoped(
   # there.
   with config.mutable_array_checks(False):
     jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(flat_fun, avals)
-  out = run_scoped_p.bind(*consts, jaxpr=jaxpr, collective_axes=collective_axes)
+  out = run_scoped_p.bind(*consts,
+                          jaxpr=jaxpr,
+                          collective_axes=collective_axes,
+                          ref_transforms=ref_transforms)
   return tree_util.tree_unflatten(out_tree_thunk(), out)
 
 
 @run_scoped_p.def_effectful_abstract_eval
-def _run_scoped_abstract_eval(*args, jaxpr, collective_axes):
+def _run_scoped_abstract_eval(*args, jaxpr, collective_axes, **_):
   del args, collective_axes
   # jaxpr will have effects for its inputs (Refs that are allocated) and for
   # constvars (closed over Refs). The effects for the allocated Refs are local
-  # to the jaxpr and shouldn't propagate out.
-  nonlocal_effects = {
-      eff
-      for eff in jaxpr.effects
-      if not (
-          isinstance(eff, effects.JaxprInputEffect)
-          and eff.input_index >= len(jaxpr.constvars)
-      )
-  }
+  # to the jaxpr and shouldn't propagate out. The eqn's inputs are the jaxpr's
+  # constvars, so effects on constvars propagate by constvar position.
+  constvar_idx = {v: i for i, v in enumerate(jaxpr.constvars)}
+  nonlocal_effects = set()
+  for eff in jaxpr.effects:
+    if isinstance(eff, effects.JaxprInputEffect):
+      if eff.input in constvar_idx:
+        nonlocal_effects.add(eff.replace(constvar_idx[eff.input]))
+      continue
+    nonlocal_effects.add(eff)
   return [v.aval for v in jaxpr.outvars], nonlocal_effects
 
 
@@ -737,7 +743,9 @@ def _run_scoped_discharge_rule(
     out_avals,
     *args_flat,
     jaxpr,
-    collective_axes):
+    collective_axes,
+    ref_transforms,
+    **_):
   del out_avals
   if collective_axes:
     raise NotImplementedError(
@@ -748,11 +756,11 @@ def _run_scoped_discharge_rule(
   # discharge the requested refs we need to move them to the invar set.
   jaxpr_noconst = pe.convert_constvars_jaxpr(jaxpr)
   num_return_values = len(jaxpr_noconst.outvars)
-  discharged_body, new_consts = state_discharge.discharge_state(
-      jaxpr_noconst,
-      [],
+  discharged_closed_body = state_discharge.discharge_state(
+      jax_core.ClosedJaxpr(jaxpr_noconst, ()),
       should_discharge=should_discharge + [False] * len(jaxpr.invars),
   )
+  discharged_body, new_consts = discharged_closed_body.jaxpr, discharged_closed_body.consts
   if new_consts:
     raise NotImplementedError(
         "Cannot handle new consts created by state discharge.")
@@ -763,7 +771,8 @@ def _run_scoped_discharge_rule(
   # Run_scoped discharged the external variables but the scoped ones
   # are not discharged.
   out = run_scoped_p.bind(
-      *args_flat, jaxpr=discharged_body, collective_axes=collective_axes
+      *args_flat, jaxpr=discharged_body, collective_axes=collective_axes,
+      ref_transforms=ref_transforms,
   )
   # Order of outputs:
   # (1) return values, (2) closed refs, (3) scoped refs.
@@ -783,7 +792,7 @@ state_discharge.register_partial_discharge_rule(run_scoped_p)(
 
 
 @functools.partial(mlir.register_lowering, run_scoped_p)
-def _run_scoped_lowering_rule(ctx, *args, jaxpr, collective_axes):
+def _run_scoped_lowering_rule(ctx, *args, jaxpr, collective_axes, **_):
   if collective_axes:
     raise ValueError(
         "run_scoped lowering outside of Pallas does not support"
@@ -791,9 +800,11 @@ def _run_scoped_lowering_rule(ctx, *args, jaxpr, collective_axes):
     )
   jaxpr_noconst = pe.convert_constvars_jaxpr(jaxpr)
   num_return_values = len(jaxpr_noconst.outvars)
-  discharged_body, new_consts = state_discharge.discharge_state(
-      jaxpr_noconst, [], should_discharge=True)
-  if new_consts:    raise NotImplementedError(
+  discharged_closed_body = state_discharge.discharge_state(
+      jax_core.ClosedJaxpr(jaxpr_noconst, ()), should_discharge=True)
+  discharged_body, new_consts = discharged_closed_body.jaxpr, discharged_closed_body.consts
+  if new_consts:
+    raise NotImplementedError(
         "Cannot handle new consts created by state discharge.")
 
   def _lower_fun(*lower_fun_args):
@@ -1372,9 +1383,10 @@ def _jaxpr_call_discharge(
       [treedef.num_leaves for treedef in ref_treedefs[: len(ref_treedefs) - 1]],
   )
   should_discharge = [*map(any, flat_should_discharge)]
-  discharged_jaxpr, discharged_consts = state_discharge.discharge_state(
-      jaxpr, (), should_discharge=should_discharge
+  discharged_closed_jaxpr = state_discharge.discharge_state(
+      jax_core.ClosedJaxpr(jaxpr, ()), should_discharge=should_discharge
   )
+  discharged_jaxpr, discharged_consts = discharged_closed_jaxpr.jaxpr, discharged_closed_jaxpr.consts
   assert not discharged_consts
   outs = jaxpr_call_p.bind(
       *flat_args,

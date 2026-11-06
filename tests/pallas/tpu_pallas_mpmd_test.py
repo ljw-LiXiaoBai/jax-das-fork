@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Tests for Pallas MPMD kernels."""
+
 import dataclasses
 import functools
 import re
@@ -22,11 +23,15 @@ import jax
 from jax._src import core as jax_core
 from jax._src import hijax
 from jax._src import test_util as jtu
+from jax._src.pallas.fuser import fusible_dtype
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import fuser
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
+import jax.ad_checkpoint
 import jax.numpy as jnp
 import numpy as np
+
 
 jax.config.parse_flags_with_absl()
 
@@ -105,9 +110,6 @@ class MpmdAsyncTest(jtu.JaxTestCase):
               pltpu.SemaphoreType.DMA(()) @ tc_mesh,
           ),
           scratch_types=[pltpu.SemaphoreType.DMA(())],
-          compiler_params=pltpu.CompilerParams(
-              use_tc_tiling_on_sc=True,
-          ),
           name=f"sc_copy_start_{x.shape[0]}",
       )(scalar_subcore_fn)(x_ref)
       out_ref = jax.new_ref(out)
@@ -243,9 +245,6 @@ class MpmdTest(PallasSCTest):
   @parameterized.product(use_tc_tiling=[False, True],
                          scratch_structure=[tuple, dict])
   def test_parallel_subkernels(self, use_tc_tiling, scratch_structure):
-    if not jtu.is_cloud_tpu_at_least(2026, 3, 28):
-      self.skipTest("Needs a newer libtpu")
-
     v_mesh = plsc.VectorSubcoreMesh(
         core_axis_name="s_core",
         subcore_axis_name="subcore",
@@ -304,9 +303,6 @@ class MpmdTest(PallasSCTest):
 
   @parameterized.product(use_tc_tiling=[False, True])
   def test_parallel_subkernels_with_kernel(self, use_tc_tiling):
-    if not jtu.is_cloud_tpu_at_least(2026, 3, 28):
-      self.skipTest("Needs a newer libtpu")
-
     v_mesh = plsc.VectorSubcoreMesh(
         core_axis_name="s_core",
         subcore_axis_name="subcore",
@@ -572,6 +568,33 @@ class MpmdTest(PallasSCTest):
     out = jax.vmap(run_kernel)(x[jnp.newaxis])
     np.testing.assert_array_equal(out, x[jnp.newaxis] + 1)
 
+  def test_remat_with_checkpoint(self):
+    mesh = pltpu.create_tensorcore_mesh("tc", num_cores=1)
+
+    kernel_impl = pl.kernel(
+        pltpu.sync_copy,
+        mesh=mesh,
+        out_type=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+    )
+
+    # NOTE: ``mpmd_map`` does not yet have a general purpose jvp rule, so we
+    # need to use ``custom_vjp`` to define one.
+    @jax.custom_vjp
+    def kernel(x):
+      return kernel_impl(x)
+
+    kernel.defvjp(lambda x: (kernel_impl(x), ()), lambda res, g: (g,))
+
+    def f(x):
+      def block(x):
+        y = jax.ad_checkpoint.checkpoint_name(x * 2.0, name="y")
+        return kernel(y)
+      policy = jax.checkpoint_policies.save_only_these_names("y")
+      return jax.remat(block, policy=policy)(x).sum()
+
+    x = jnp.ones((8, 128), dtype=jnp.float32)
+    np.testing.assert_array_equal(jax.grad(f)(x), jnp.full_like(x, 2.0))
+
   @parameterized.product(
       use_tc_tiling=(False, True), full_core_spec=(True, False),
       signalling_direction=("scs_to_tec", "tec_to_scs", "both"),
@@ -709,7 +732,6 @@ class MpmdTest(PallasSCTest):
           body=[vector_subcore_fn, scalar_subcore_fn],
           mesh=[v_mesh, s_mesh],
           out_type=(jax.typeof(x1), jax.typeof(x2)),
-          compiler_params=pltpu.CompilerParams(use_tc_tiling_on_sc=True),
           scratch_types=[
               # SCS -> TEC
               pltpu.SemaphoreType.REGULAR(()) @ v_mesh,
@@ -723,9 +745,6 @@ class MpmdTest(PallasSCTest):
     np.testing.assert_array_equal(o2, x2)
 
   def test_parallel_subkernels_semaphores_missing_subcore_axis(self):
-    if not jtu.is_cloud_tpu_at_least(2026, 3, 1):
-      self.skipTest("Need a newer libtpu")
-
     v_mesh = plsc.VectorSubcoreMesh(
         core_axis_name="s_core",
         subcore_axis_name="subcore",
@@ -949,8 +968,6 @@ class MpmdHijaxTest(jtu.JaxTestCase):
   def test_parallel_subkernels_hijax(self):
     if pltpu.get_tpu_info().sparse_core is None:
       self.skipTest("Test needs a TPU with a sparse core")
-    if not jtu.is_cloud_tpu_at_least(2026, 3, 28):
-      self.skipTest("Needs a newer libtpu")
     xt = WeirdTuple(
         x0=jnp.ones((8, 128), dtype=jnp.int32),
         x1=jnp.zeros((8,), dtype=jnp.int32),
@@ -1018,6 +1035,84 @@ class MpmdHijaxTest(jtu.JaxTestCase):
     ot = f(xt)
     self.assertArraysEqual(ot.x0, xt.x0)
     self.assertArraysEqual(ot.x1, xt.x1)
+
+
+class MpmdPhysicalizeTest(jtu.JaxTestCase):
+
+  def setUp(self):
+    if not jtu.is_device_tpu():
+      self.skipTest("Only works on TPU.")
+    super().setUp()
+
+  def test_mpmd_map_physicalize(self):
+
+    @dataclasses.dataclass(frozen=True)
+    class SimpleFusionDType(fusible_dtype.FusionDType):
+
+      def __str__(self):
+        return "simple_fusion_dtype"
+
+      def abstract_unpack(self, x):
+        if isinstance(x, jax_core.ShapedArray):
+          return (x.update(dtype=jnp.float32), x.update(dtype=jnp.float32))
+        raise NotImplementedError(type(x))
+
+      def abstract_pack(self, x, y):
+        if isinstance(x, jax_core.ShapedArray):
+          return x.update(dtype=self)
+        raise NotImplementedError(type(x))
+
+      def pull_block_spec_one_step(self, aval_out, block_spec):
+        return block_spec, block_spec
+
+      def unpack_push_block_spec(self, aval_in, block_spec):
+        return block_spec, block_spec
+
+      def unpack_pull_block_spec(self, aval_in, block_spec1, block_spec2):
+        return (block_spec1,)
+
+      def pack_eval_rule(self, eval_ctx, x, y):
+        return fusible_dtype.pack_dtype_p.bind(x, y, dtype=self)
+
+      def unpack_eval_rule(self, eval_ctx, x):
+        return fusible_dtype.unpack(x)
+
+    mesh = pltpu.create_tensorcore_mesh("tc_core", num_cores=1)
+
+    def subkernel(x_ref, y_ref, out_ref, x_vmem, y_vmem, out_vmem):
+      pltpu.sync_copy(x_ref, x_vmem)
+      pltpu.sync_copy(y_ref, y_vmem)
+      packed = fusible_dtype.pack(
+          x_vmem[...], y_vmem[...], dtype=SimpleFusionDType()
+      )
+      x_val, y_val = fusible_dtype.unpack(packed)
+      out_vmem[...] = x_val + y_val
+      pltpu.sync_copy(out_vmem, out_ref)
+
+    @fuser.fusible
+    def mpmd_f(x_fn, y_fn, z_fn):
+      x = x_fn()
+      y = y_fn()
+      out = pl.kernel(
+          body=subkernel,
+          mesh=mesh,
+          out_type=jax.ShapeDtypeStruct.like(x),
+          scratch_types=(
+              pltpu.VMEM(x.shape, x.dtype),
+              pltpu.VMEM(x.shape, x.dtype),
+              pltpu.VMEM(x.shape, x.dtype),
+          ),
+      )(x, y)
+      if z_fn is None:
+        z_fn = lambda x: x
+      return z_fn(out)
+
+    x = jnp.ones((8, 8), dtype=jnp.float32)
+    y = jnp.ones((8, 8), dtype=jnp.float32)
+
+    physicalized_f = fusible_dtype.physicalize(mpmd_f)
+    res = physicalized_f(x, y)
+    np.testing.assert_allclose(res, x + y)
 
 
 if __name__ == "__main__":

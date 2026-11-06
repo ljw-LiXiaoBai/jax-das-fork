@@ -18,6 +18,7 @@ from collections.abc import Callable, Sequence
 import dataclasses
 from functools import update_wrapper, reduce, partial, wraps
 from typing import Any, Generic, TypeVar
+import itertools as it
 
 from jax._src import config
 from jax._src import core
@@ -38,7 +39,6 @@ from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
-from jax._src.interpreters.batching import not_mapped
 from jax._src.tree_util import (
     tree_flatten, tree_unflatten, tree_map, treedef_is_leaf, treedef_tuple,
     register_pytree_node_class, tree_leaves, tree_flatten_with_path,
@@ -63,6 +63,29 @@ def _initial_style_jaxpr(fun: lu.WrappedFun,
 
 def _close_jaxpr(jaxpr: core.Jaxpr) -> core.ClosedJaxpr:
   return pe.close_jaxpr(pe.convert_constvars_jaxpr(jaxpr))
+
+def _lower_and_eval(
+    name: str, jaxpr: core.ClosedJaxpr, args: Sequence[Any]
+) -> list[Any]:
+  from jax._src.lax.eval_jaxpr import eval_jaxpr_p  # pyrefly: ignore[missing-import]
+  if any(aval.has_qdd for aval in jaxpr.in_aval_qdds):
+    raise NotImplementedError(f"{name!r} does not support qdd on inputs")
+  if any(aval.has_qdd for aval in jaxpr.final_aval_qdds):
+    raise NotImplementedError(f"{name!r} does not support qdd on outputs")
+
+  lo_jaxpr = pe.lower_jaxpr2(jaxpr)
+  lo_args = [
+      lo_val for aval, x in zip(jaxpr.in_avals, args)
+      for lo_val in aval.lower_val(x)  # pyrefly: ignore[missing-attribute]
+  ]
+  lo_outs = eval_jaxpr_p.bind(*lo_args, jaxpr=lo_jaxpr)
+  lo_outs_ = iter(lo_outs)
+  hi_outs = [
+      t.raise_val(*it.islice(lo_outs_, len(t.lo_ty())))
+      for t in jaxpr.out_avals
+  ]
+  assert next(lo_outs_, None) is None
+  return hi_outs
 
 def _sum_tangents(_, x, *xs):
   return reduce(ad.add_tangents, xs, x)
@@ -393,6 +416,12 @@ class CustomJVPCallPrimitive(core.Primitive):
   def impl(self, fun, _, *args):
     raise NotImplementedError
 
+  def is_high(self, *_, call_jaxpr, **__):
+    return call_jaxpr.jaxpr.is_high
+
+  def to_lojax(self, *hi_args, call_jaxpr: core.ClosedJaxpr, **params):  # pyrefly: ignore[bad-override-mutable-attribute]
+    return _lower_and_eval("custom_jvp_call", call_jaxpr, hi_args)
+
   def get_bind_params(self, params):
     new_params = dict(params)
     call_jaxpr: core.ClosedJaxpr = new_params.pop('call_jaxpr')
@@ -432,7 +461,7 @@ def _custom_jvp_call_typecheck(_, *in_avals, call_jaxpr, jvp_jaxpr_fun,
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `custom_jvp`: {disallowed_effects}')
-  return call_jaxpr.out_avals, call_jaxpr.effects
+  return call_jaxpr.out_avals, core.positional_effects(call_jaxpr)
 core.custom_typechecks[custom_jvp_call_p] = _custom_jvp_call_typecheck
 
 def _custom_jvp_vjp_call_lowering(ctx: mlir.LoweringRuleContext, *args,
@@ -494,7 +523,8 @@ def _custom_jvp_call_dce(
                                  debug_info=jvp_jaxpr_fun.debug_info)
   )
   new_eqn = pe.new_jaxpr_eqn(
-      eqn.invars, outvars, eqn.primitive, new_params, dce_call_jaxpr.effects,
+      eqn.invars, outvars, eqn.primitive, new_params,
+      core.eqn_effects(dce_call_jaxpr, eqn.invars),
       eqn.source_info, eqn.ctx)
   return used_ins, new_eqn
 pe.dce_rules[custom_jvp_call_p] = _custom_jvp_call_dce
@@ -730,7 +760,7 @@ class custom_vjp(Generic[ReturnValue]):
       fwd_ = lu.wrap_init(fwd, debug_info=debug_fwd)
       bwd = lu.wrap_init(self.bwd, debug_info=debug_bwd)
     args_flat, in_tree = tree_flatten(dyn_args)
-    in_avals = [core.typeof(x) for x in args_flat]
+    in_avals = tuple(core.typeof(x) for x in args_flat)
     if config.mutable_array_checks.value:
       f_ = _check_primal_refs(f_, self.nondiff_argnums, f_.debug_info)
     flat_fun, out_type = _flatten_fun_nokwargs(f_, in_tree)
@@ -786,7 +816,7 @@ def _check_for_returned_refs(f, out, kind, args, after_idx):
                          f"array reference of type {a.str_short()}{loc} "
                          "that was not an argument.")
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class CustomVJPPrimal:
   """Primal to a ``custom_vjp``'s forward rule when ``symbolic_zeros`` is set"""
   value: Any
@@ -901,7 +931,7 @@ def _filter_forwarded_inputs(outs, ins):
 @lu.transformation2
 def _flatten_bwd(f: Callable,
                  in_tree: PyTreeDef,
-                 in_avals: Sequence[core.AbstractValue],
+                 in_avals: Sequence[core.AbstractValue],  # primal avals
                  out_trees: Callable[[], tuple[PyTreeDef, PyTreeDef, list[int | None]]],
                  *args):
   out_tree, res_tree, _ = out_trees()
@@ -995,6 +1025,12 @@ class CustomVJPCallPrimitive(core.Primitive):
   def impl(self, fun, fwd, bwd, *args):
     raise NotImplementedError
 
+  def is_high(self, *_, call_jaxpr, **__):
+    return call_jaxpr.jaxpr.is_high
+
+  def to_lojax(self, *hi_args, call_jaxpr: core.ClosedJaxpr, **params):  # pyrefly: ignore[bad-override-mutable-attribute]
+    return _lower_and_eval("custom_vjp_call", call_jaxpr, hi_args)
+
   def get_bind_params(self, params):
     new_params = dict(params)
     call_jaxpr: core.ClosedJaxpr = new_params.pop('call_jaxpr')
@@ -1035,7 +1071,7 @@ def _custom_vjp_call_typecheck(_, *in_avals, call_jaxpr, **kwargs):
   if disallowed_effects:
     raise NotImplementedError(
         f'Effects not supported in `custom_vjp`: {disallowed_effects}')
-  return call_jaxpr.out_avals, call_jaxpr.effects
+  return call_jaxpr.out_avals, core.positional_effects(call_jaxpr)
 core.custom_typechecks[custom_vjp_call_p] = _custom_vjp_call_typecheck
 
 def _custom_vjp_call_dce(
@@ -1091,7 +1127,8 @@ def _custom_vjp_call_dce(
       bwd=dce_bwd_wrapped,
   )
   new_eqn = pe.new_jaxpr_eqn(
-      eqn.invars, outvars, eqn.primitive, new_params, dce_call_jaxpr.effects,
+      eqn.invars, outvars, eqn.primitive, new_params,
+      core.eqn_effects(dce_call_jaxpr, eqn.invars),
       eqn.source_info, eqn.ctx)
   return list(used_ins), new_eqn
 pe.dce_rules[custom_vjp_call_p] = _custom_vjp_call_dce
@@ -1697,7 +1734,7 @@ def _remat_opt_impl(
 
 def _remat_opt_abstract_eval(*args, fwd_jaxpr: core.ClosedJaxpr, **_):
   del args
-  return fwd_jaxpr.out_avals, fwd_jaxpr.effects
+  return fwd_jaxpr.out_avals, core.positional_effects(fwd_jaxpr)
 
 def _remat_opt_vmap(
     axis_data, args, in_dims,
@@ -1707,15 +1744,15 @@ def _remat_opt_vmap(
     fwd_jaxpr: core.ClosedJaxpr,
     fun_jaxpr_thunk: Callable[[], tuple[core.Jaxpr, Sequence[Any]]],
 ):
-  args = [batching.moveaxis(x, d, 0) if d is not not_mapped and d != 0
+  args = [batching.moveaxis(x, d, 0) if d is not None and d != 0
           else x for x, d in zip(args, in_dims)]
-  in_batched = [d is not not_mapped for d in in_dims]
+  in_batched = [d is not None for d in in_dims]
   batched_fwd_jaxpr, out_batched = batching.batch_jaxpr(
       fwd_jaxpr, axis_data, in_batched, False)
   extra_consts = batched_fwd_jaxpr.consts
   batched_fwd_jaxpr = pe.close_jaxpr(
       pe.convert_constvars_jaxpr(batched_fwd_jaxpr.jaxpr))
-  out_dims = [0 if b else not_mapped for b in out_batched]
+  out_dims = [0 if b else None for b in out_batched]
 
   _, prim_batched = split_list(in_batched, [num_consts])
 
@@ -1806,7 +1843,8 @@ def _remat_opt_dce(used_outs: list[bool], eqn: core.JaxprEqn):
     new_params["fwd_jaxpr"] = closed_jaxpr
     new_params["num_res"] = sum(used_res)
     new_eqn = pe.new_jaxpr_eqn(
-        invars, outvars, remat_opt_p, new_params, closed_jaxpr.effects,
+        invars, outvars, remat_opt_p, new_params,
+        core.eqn_effects(closed_jaxpr, invars),
         eqn.source_info, eqn.ctx)
     return used_ins, new_eqn
   else:
@@ -1822,12 +1860,17 @@ def _remat_opt_dce(used_outs: list[bool], eqn: core.JaxprEqn):
     invars = [v for used, v in zip(used_ins, invars) if used]
     new_eqn = pe.new_jaxpr_eqn(
         invars, outvars, core.closed_call_p, dict(call_jaxpr=closed_jaxpr),
-        closed_jaxpr.effects, eqn.source_info, eqn.ctx)
+        core.eqn_effects(closed_jaxpr, invars), eqn.source_info, eqn.ctx)
     used_ins = [False] * eqn.params["num_consts"] + used_ins
     return used_ins, new_eqn
 
+def _remat_opt_to_lojax(*hi_args, fwd_jaxpr: core.ClosedJaxpr, num_consts, **params):
+  return _lower_and_eval("remat_opt", fwd_jaxpr, hi_args)
+
 remat_opt_p = core.Primitive("remat_opt")
 remat_opt_p.multiple_results = True
+remat_opt_p.is_high = lambda *_, fwd_jaxpr, **__: fwd_jaxpr.jaxpr.is_high
+remat_opt_p.to_lojax = _remat_opt_to_lojax
 remat_opt_p.def_impl(_remat_opt_impl)
 remat_opt_p.def_effectful_abstract_eval(_remat_opt_abstract_eval)
 mlir.register_lowering(remat_opt_p, mlir.lower_fun(
