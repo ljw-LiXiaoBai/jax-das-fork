@@ -64,6 +64,14 @@ try-import %workspace%/build/rocm/rocm.bazelrc
 # DTK ROCm codegen backend selection.  HCU backend only.
 common:hcu --copt=-DXLA_ROCM_ENABLE_HCU=1
 common:hcu --repo_env=HCU_ENABLED=1
+# HCU requires explicit local toolchain selection.
+common:hcu --config=clang_local
+common:hcu --crosstool_top=@local_config_rocm//crosstool:toolchain
+# Half conversions require the selected compiler runtime.
+common:hcu --linkopt=-rtlib=compiler-rt
+common:hcu --host_linkopt=-rtlib=compiler-rt
+common:hcu --linkopt=--unwindlib=libgcc
+common:hcu --host_linkopt=--unwindlib=libgcc
 
 # #############################################################################
 # Platform Specific configs below. These are automatically picked up by Bazel
