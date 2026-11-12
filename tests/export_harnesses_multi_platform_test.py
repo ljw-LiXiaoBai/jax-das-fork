@@ -87,31 +87,6 @@ class PrimitiveTest(jtu.JaxTestCase):
     if harness.params.get("enable_xla", False):
       self.skipTest("enable_xla=False is not relevant")
 
-    # These harnesses compare unequal between the natively executed and the
-    # exported computation on the Hygon CPU backend. The mismatch comes from the
-    # CPU backend, not from HCU. 
-    hygon_cpu_mismatch = tuple(
-        f"conv_general_dilated_{name}_lhs" for name in (
-            "conv1d",
-            "depthwise1d",
-            "depthwise1d_dilated",
-            "depthwise2d",
-            "depthwise2d_dilated",
-            "dimension_numbers",
-            "padding",
-            "preferred",
-            "rhs_oob_same_padding",
-            "tf_conversion_path_1d",
-            "tf_conversion_path_2d",
-        )
-    ) + (
-        "custom_linear_solve_dtypes_a_float32",
-        "custom_linear_solve_symmetric_a_float32",
-        "custom_linear_solve_transpose_solve_a_float32",
-    )
-    if jtu.is_device_rocm() and harness.fullname.startswith(hygon_cpu_mismatch):
-      self.skipTest("Numerical mismatch on the Hygon CPU backend")
-
     func_jax = harness.dyn_fun
     args = harness.dyn_args_maker(self.rng())
 
