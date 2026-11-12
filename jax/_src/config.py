@@ -2293,15 +2293,6 @@ jax_ragged_dot_use_gpu_pallas_triton_lowering = bool_state(
     include_in_trace_context=True,
 )
 
-pallas_enable_debug_checks = bool_state(
-    "jax_pallas_enable_debug_checks",
-    default=False,
-    help=(
-        "If set, ``pl.debug_check`` calls are checked at runtime. Otherwise,"
-        " they are a noop."
-    ),
-)
-
 jax_pallas_verbose_errors = bool_flag(
     'jax_pallas_verbose_errors',
     default=bool_env('JAX_PALLAS_VERBOSE_ERRORS', False),
