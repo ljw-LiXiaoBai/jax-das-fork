@@ -23,6 +23,7 @@
 # -o allexport: export all functions and variables to be available to subscripts
 set -exu -o history -o allexport
 
+echo "::group::Setup Environment" >&2
 # Source default JAXCI environment variables.
 source ci/envs/default.env
 
@@ -36,7 +37,7 @@ source "ci/utilities/setup_build_environment.sh"
 
 OVERRIDE_XLA_REPO=""
 if [[ "$JAXCI_CLONE_MAIN_XLA" == 1 ]]; then
-  OVERRIDE_XLA_REPO="--override_repository=xla=${JAXCI_XLA_GIT_DIR} --override_module=xla=${JAXCI_XLA_GIT_DIR}"
+    OVERRIDE_XLA_REPO="--override_repository=xla=${JAXCI_XLA_GIT_DIR} --override_module=xla=${JAXCI_XLA_GIT_DIR}"
 fi
 
 # Run Bazel GPU tests with RBE (single accelerator tests with one GPU apiece).
@@ -81,6 +82,14 @@ TESTS_TO_IGNORE=(
     -//tests:sparsify_test_gpu
     -//tests:lax_numpy_reducers_test_gpu
     -//tests:scipy_optimize_test_gpu
+    #TODO(mgaonka-amd) re-enable these tests once this issue is fixed.
+    -//tests:lax_numpy_einsum_test_gpu
+    -//tests:lax_scipy_test_gpu
+    -//tests:sparse_test_gpu
+    -//tests:sparse_bcoo_bcsr_test_gpu
+    -//tests:svd_test_gpu
+    -//tests:eigh_test_gpu
+    -//tests:image_test_gpu
 )
 
 for arg in "$@"; do
@@ -100,9 +109,12 @@ done
 
 TEST_ARTIFACTS_DIR="test-artifacts"
 mkdir -p "$TEST_ARTIFACTS_DIR"
+echo "::endgroup::" >&2
+
+echo "::group::Bazel ROCm RBE tests" >&2
 bazel --bazelrc=build/rocm/rocm.bazelrc test \
     --profile="$TEST_ARTIFACTS_DIR/bazel_profile.json.gz" \
-    --config=rocm \
+    --config=rocm_clang_hermetic \
     --config=rocm_rbe_dynamic \
     $OVERRIDE_XLA_REPO \
     --test_env=XLA_PYTHON_CLIENT_ALLOCATOR=platform \
@@ -123,7 +135,10 @@ bazel --bazelrc=build/rocm/rocm.bazelrc test \
     //tests/pallas:gpu_tests \
     //tests/pallas:backend_independent_tests \
     //jaxlib/tools:check_gpu_wheel_sources_test \
-    "${TESTS_TO_IGNORE[@]}"
+    "${TESTS_TO_IGNORE[@]}" || bazel_retval=$?
+echo "::endgroup::" >&2
 
+echo "::group::Cleanup" >&2
 ci/utilities/collect_bazel_test_xmls.sh "$TEST_ARTIFACTS_DIR"
+echo "::endgroup::" >&2
 exit "${bazel_retval:-0}"

@@ -72,9 +72,9 @@ from jax._src.pallas.mosaic.tpu_info import is_tpu_device as is_tpu_device
 from jax._src.pallas.mosaic.tpu_info import Tiling as Tiling
 from jax._src.pallas.mosaic.tpu_info import TpuInfo as TpuInfo
 
+from jax._src.pallas import core as _pl_core
 from jax._src.pallas.core import semaphore as _deprecated_semaphore
 from jax._src.pallas.primitives import DeviceIdType as _DeprecatedDeviceIdType
-from jax._src.pallas.mosaic.primitives import repeat as _deprecated_repeat
 from jax._src.pallas.primitives import semaphore_read as _deprecated_semaphore_read
 from jax._src.pallas.primitives import semaphore_signal as _deprecated_semaphore_signal
 from jax._src.pallas.primitives import semaphore_wait as _deprecated_semaphore_wait
@@ -89,11 +89,15 @@ SMEM = MemorySpace.SMEM
 VMEM = MemorySpace.VMEM
 VMEM_SHARED = MemorySpace.VMEM_SHARED
 HBM = MemorySpace.HBM
-HOST = MemorySpace.HOST
 SEMAPHORE = MemorySpace.SEMAPHORE
 
 
 _deprecations = {
+    # Added June 4, 2026
+    "HOST": (
+        "pltpu.HOST is deprecated, use pl.HOST instead.",
+        _pl_core.MemorySpace.HOST,
+    ),
     # Added Mar 24, 2026
     "semaphore": ("pltpu.semaphore is deprecated, use pl.semaphore instead.", _deprecated_semaphore),
     "DeviceIdType": (
@@ -112,16 +116,6 @@ _deprecations = {
         "pltpu.semaphore_wait is deprecated, use pl.semaphore_wait instead.",
         _deprecated_semaphore_wait,
     ),
-    # Added Feb 11, 2026
-    "repeat": (
-        "pltpu.repeat is deprecated, use jnp.tile instead.",
-        _deprecated_repeat
-    ),
-    # Added Feb 19, 2026
-    "KernelType": (
-        "pltpu.KernelType is deprecated, use pltpu.CoreType instead.",
-        CoreType
-    ),
 }
 
 if typing.TYPE_CHECKING:
@@ -130,8 +124,7 @@ if typing.TYPE_CHECKING:
   semaphore_read = _deprecated_semaphore_read
   semaphore_signal = _deprecated_semaphore_signal
   semaphore_wait = _deprecated_semaphore_wait
-  repeat = _deprecated_repeat
-  KernelType = CoreType
+  HOST = _pl_core.MemorySpace.HOST
 else:
   from jax._src.deprecations import deprecation_getattr as _deprecation_getattr
   __getattr__ = _deprecation_getattr(__name__, _deprecations)

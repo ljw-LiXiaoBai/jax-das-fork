@@ -21,6 +21,7 @@ import subprocess
 import sys
 import unittest
 from typing import Any
+import warnings
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -28,12 +29,12 @@ import jax
 from jax import api_util
 from jax import lax
 from jax import random
+from jax._src import config
 from jax._src import dtypes
 from jax._src import linear_util as lu
 from jax._src import state
 from jax._src import test_util as jtu
 from jax._src import hypothesis_test_util as htu
-from jax._src.pallas import pallas_call
 from jax._src.pallas import pallas_test_util as ptu
 from jax._src.pallas import primitives as pallas_primitives
 from jax.experimental import pallas as pl
@@ -62,7 +63,7 @@ import hypothesis.strategies as hps
 jax.config.parse_flags_with_absl()
 htu.setup_hypothesis(max_examples=50)
 
-use_mosaic_gpu = pallas_call._PALLAS_USE_MOSAIC_GPU.value
+use_mosaic_gpu = config.jax_pallas_use_mosaic_gpu.value
 
 intx = dtypes.default_int_dtype()
 floatx = dtypes.default_float_dtype()
@@ -331,6 +332,19 @@ class PallasBaseTest(ptu.PallasTest):
 
 @jtu.thread_unsafe_test_class(condition=not htu.hypothesis_is_thread_safe())
 class OpsTest(PallasBaseTest):
+
+  def setUp(self):
+    if jtu.test_device_matches(["gpu"]) and use_mosaic_gpu:
+      self.enter_context(warnings.catch_warnings())
+      warnings.filterwarnings(
+          "ignore",
+          category=DeprecationWarning,
+          message=(
+              "Using ``pl.pallas_call`` for Mosaic GPU kernels is deprecated"
+          ),
+      )
+
+    super().setUp()
 
   @parameterized.named_parameters(
       (fn.__name__, fn, dtype) for fn, dtype in [
@@ -664,6 +678,8 @@ class OpsTest(PallasBaseTest):
     if to_dtype in {"float8_e4m3b11fnuz", "float8_e5m2", "float8_e4m3fn"}:
       if not jtu.test_device_matches(["tpu"]):
         self.skipTest("Not supported on this hardware")
+      elif not jtu.is_cloud_tpu_at_least(2026, 5, 26):
+        self.skipTest("Requires libtpu built on or after 2026-05-26")
     if from_dtype == to_dtype:
       self.skipTest("Unnecessary test")
     if jtu.is_device_tpu(version=4):
@@ -758,6 +774,8 @@ class OpsTest(PallasBaseTest):
     } or to_dtype in {"float8_e4m3b11fnuz", "float8_e5m2", "float8_e4m3fn"}:
       if not jtu.test_device_matches(["tpu"]):
         self.skipTest("Not supported on this hardware")
+      elif not jtu.is_cloud_tpu_at_least(2026, 5, 26):
+        self.skipTest("Requires libtpu built on or after 2026-05-26")
     if from_dtype in ("uint2", "int2") and to_dtype == "bool":
       self.skipTest(
           "TODO(b/343490729): XLA compare(s2, s2) yields wrong results"
@@ -855,6 +873,9 @@ class OpsTest(PallasBaseTest):
   )
   @jtu.skip_on_devices("gpu")
   def test_scalar_downcast_float32(self, dtype):
+    if dtype in {jnp.float8_e5m2, jnp.float8_e4m3fn}:
+      if not jtu.is_cloud_tpu_at_least(2026, 5, 26):
+        self.skipTest("Requires libtpu built on or after 2026-05-26")
 
     def kernel(x_ref, o_ref):
       o_ref[0, 0] = x_ref[:][0, 0].astype(dtype)
@@ -964,10 +985,6 @@ class OpsTest(PallasBaseTest):
       if dtype in (jnp.int16, jnp.uint16):
         if jtu.get_tpu_version() < 4:
           self.skipTest("requires TPU v4+")
-        if jtu.get_tpu_version() < 6 and not jtu.is_cloud_tpu_at_least(
-            2026, 4, 6
-        ):
-          self.skipTest("requires newer libTPU")
 
     @functools.partial(
         self.pallas_call,
@@ -1164,21 +1181,7 @@ class OpsTest(PallasBaseTest):
       if dtype == "int16":
         if fn in (jnp.sign, jnp.abs) and not jtu.is_device_tpu_at_least(4):
           self.skipTest("requires TPU v4+")
-        if fn == jnp.abs and not jtu.is_cloud_tpu_at_least(2026, 5, 10):
-          self.skipTest("requires newer libTPU")
-      if (
-          fn in (jnp.ceil, jnp.floor, jnp.sqrt, lax.rsqrt)
-          and dtype == "bfloat16"
-          and not jtu.is_device_tpu_at_least(6)
-          and not jtu.is_cloud_tpu_at_least(2026, 4, 27)
-      ):
-        self.skipTest("requires newer libTPU")
-      if (
-          fn == jnp.log1p
-          and dtype == "bfloat16"
-          and not jtu.is_cloud_tpu_at_least(2026, 5, 12)
-      ):
-        self.skipTest("requires newer libTPU")
+
       # TODO(b/370578663): implement these lowerings on TPU
       if fn in (
           jnp.acos, jnp.acosh, jnp.asin, jnp.asinh, jnp.atan, jnp.atanh,
@@ -1563,7 +1566,7 @@ class OpsTest(PallasBaseTest):
 
     @functools.partial(
         self.pallas_call,
-        out_shape=jax.ShapeDtypeStruct(expected.shape, jnp.float32),
+        out_shape=jax.ShapeDtypeStruct.like(expected),
     )
     def kernel(x_ref, y_ref, out_ref):
       out_ref[...] = jax.lax.dot_general(
@@ -1600,7 +1603,7 @@ class OpsTest(PallasBaseTest):
 
     @functools.partial(
         self.pallas_call,
-        out_shape=jax.ShapeDtypeStruct(expected.shape, jnp.float32),
+        out_shape=jax.ShapeDtypeStruct.like(expected),
     )
     def kernel(x_ref, y_ref, out_ref):
       out_ref[...] = jax.lax.dot_general(
@@ -1702,7 +1705,7 @@ class OpsTest(PallasBaseTest):
 
     @functools.partial(
         self.pallas_call,
-        out_shape=jax.ShapeDtypeStruct(expected.shape, jnp.float32),
+        out_shape=jax.ShapeDtypeStruct.like(expected),
     )
     def kernel(x_ref, y_ref, out_ref):
       if x_perm:
@@ -1759,11 +1762,12 @@ class OpsTest(PallasBaseTest):
         rhs,
         dimension_numbers=dims_numbers,
         preferred_element_type=jnp.float32,
+        precision=jax.lax.Precision.HIGHEST,
     )
 
     @functools.partial(
         self.pallas_call,
-        out_shape=jax.ShapeDtypeStruct(expected.shape, jnp.float32),
+        out_shape=jax.ShapeDtypeStruct.like(expected),
     )
     def kernel(lhs_ref, rhs_ref, out_ref):
       out_ref[...] = jax.lax.dot_general(
@@ -1771,9 +1775,71 @@ class OpsTest(PallasBaseTest):
           rhs_ref[...],
           dimension_numbers=dims_numbers,
           preferred_element_type=jnp.float32,
+          precision=jax.lax.Precision.HIGHEST,
       )
 
     np.testing.assert_allclose(kernel(lhs, rhs), expected, atol=5e-6, rtol=5e-4)
+
+  @parameterized.product(
+      batch_size=(None, 1, 2),
+      transpose_rhs=(True, False),
+      dtype=(jnp.float32,),
+  )
+  def test_dot_general_with_1d_lhs(self, batch_size, transpose_rhs, dtype):
+    if jtu.test_device_matches(["gpu"]):
+      self.skipTest("TPU only test")
+    if not jtu.is_cloud_tpu_at_least(2026, 5, 30):
+      self.skipTest("Requires newer libtpu")
+
+    batch_shape = (batch_size,) if batch_size is not None else ()
+    batch_dim = [0] if batch_size else []
+    k = 256
+    m = 1024
+    lhs_shape = (*batch_shape, k)
+    rhs_shape = (*batch_shape, m, k) if transpose_rhs else (*batch_shape, k, m)
+    k1, k2 = random.split(jax.random.key(0))
+    lhs = (
+        jax.random.normal(k1, lhs_shape, dtype=dtype)
+        .astype(jnp.bfloat16)
+        .astype(dtype)
+    )
+    rhs = (
+        jax.random.normal(k2, rhs_shape, dtype=dtype)
+        .astype(jnp.bfloat16)
+        .astype(dtype)
+    )
+    dimension_numbers = (
+        (
+            [len(lhs_shape) - 1],
+            [len(rhs_shape) - 1 if transpose_rhs else len(rhs_shape) - 2],
+        ),
+        (batch_dim, batch_dim),
+    )
+    expected = jax.lax.dot_general(
+        lhs,
+        rhs,
+        dimension_numbers=dimension_numbers,
+        preferred_element_type=jnp.float32,
+    )
+
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct(expected.shape, dtype),
+    )
+    def kernel(lhs_ref, rhs_ref, out_ref):
+      out_ref[...] = jax.lax.dot_general(
+          lhs_ref[...],
+          rhs_ref[...],
+          dimension_numbers=dimension_numbers,
+          preferred_element_type=jnp.float32,
+      )
+
+    np.testing.assert_allclose(
+        kernel(lhs, rhs),
+        expected,
+        atol=5e-6,
+        rtol=5e-4,
+    )
 
   @parameterized.parameters(
       ("int32", "float32"),
@@ -1852,10 +1918,6 @@ class OpsTest(PallasBaseTest):
       if dtype == "int16":
         if jtu.get_tpu_version() < 4:
           self.skipTest("requires TPUv4+")
-        if jtu.get_tpu_version() < 6 and not jtu.is_cloud_tpu_at_least(
-            2026, 4, 6
-        ):
-          self.skipTest("requires TPUv6+")
 
     @functools.partial(
         self.pallas_call, out_shape=jax.ShapeDtypeStruct((8,), dtype),
@@ -1900,17 +1962,37 @@ class OpsTest(PallasBaseTest):
 
     np.testing.assert_allclose(f(x, y), kernel(x, y))
 
-  @parameterized.parameters(
-      ((32,), jnp.int32, 0),
-      ((8, 4), jnp.int32, 0),
-      ((8, 16), jnp.float32, 1),
-      ((8, 16, 2), jnp.int8, 1),
+  @parameterized.product(
+      shape_and_dimension=[
+          ((32,), 0),
+          ((8, 4), 0),
+          ((8, 4), 1),
+          ((8, 16, 2), 0),
+          ((8, 16, 2), 1),
+          ((8, 16, 2), 2),
+      ],
+      dtype=[jnp.float32, jnp.int32, jnp.int16, jnp.int8],
   )
-  def test_iota(self, shape, dtype, dimension):
+  def test_iota(self, shape_and_dimension, dtype):
     self.skip_if_mosaic_gpu()
 
-    if jtu.test_device_matches(["tpu"]) and dtype != jnp.int32:
-      self.skipTest("Only 32-bit integer iota supported")
+    shape, dimension = shape_and_dimension
+    if jtu.test_device_matches(["tpu"]):
+      if dtype == jnp.float32:
+        self.skipTest("only int iota is supported on TPU")
+      if (
+          dtype == jnp.int8
+          and len(shape) == 1
+          and not jtu.is_device_tpu_at_least(5)
+      ):
+        self.skipTest("Requires TPUv5+")
+      if (
+          dtype == jnp.int16
+          # Sublane iota not supported on TPU < 4
+          and (len(shape) == 1 or dimension == len(shape) - 2)
+          and not jtu.is_device_tpu_at_least(4)
+      ):
+        self.skipTest("Requires TPUv4+")
 
     f = lambda: jax.lax.broadcasted_iota(dtype, shape, dimension)
 
@@ -2181,7 +2263,12 @@ class OpsTest(PallasBaseTest):
     def dot(x_ref, y_ref, o_ref):
       x = x_ref[:, :]
       y = y_ref[:, :]
-      o_ref[:, :] = pl.dot(x, y, trans_x, trans_y).astype(o_ref.dtype)
+      lhs_pattern = "km" if trans_x else "mk"
+      rhs_pattern = "nk" if trans_y else "kn"
+      o_ref[:, :] = jnp.einsum(
+          f"{lhs_pattern},{rhs_pattern}->mn", x, y,
+          preferred_element_type=jnp.float32,
+      ).astype(o_ref.dtype)
 
     k1, k2 = random.split(random.key(0))
     x = random.normal(k1, lhs_shape, dtype=dtype)
@@ -2220,7 +2307,14 @@ class OpsTest(PallasBaseTest):
     def dot(x_ref, y_ref, o_ref):
       x = x_ref[:, :]
       y = y_ref[:, :]
-      o_ref[:, :] = pl.dot(x, y, trans_x, trans_y).astype(o_ref.dtype)
+      lhs_pattern = "km" if trans_x else "mk"
+      rhs_pattern = "nk" if trans_y else "kn"
+      o_ref[:, :] = jnp.einsum(
+          f"{lhs_pattern},{rhs_pattern}->mn",
+          x,
+          y,
+          preferred_element_type=jnp.int32,
+      ).astype(o_ref.dtype)
 
     # random.randint does not support int4, so create as int8.
     x = random.randint(
@@ -2387,9 +2481,6 @@ class OpsTest(PallasBaseTest):
   def test_reduce_only_dim(self):
     self.skip_if_mosaic_gpu()
 
-    if not jtu.is_cloud_tpu_at_least(2026, 3, 29):
-      self.skipTest("Requires a newer libtpu")
-
     m = 32
     x = random.normal(random.key(0), (m,), dtype=jnp.float32)
     out_shape = jax.ShapeDtypeStruct((), x.dtype)
@@ -2444,10 +2535,7 @@ class OpsTest(PallasBaseTest):
       if dtype == "bfloat16":
         if jtu.get_tpu_version() < 4:
           self.skipTest("require 16-bit iota")
-        if jtu.get_tpu_version() < 6 and not jtu.is_cloud_tpu_at_least(
-            2026, 4, 6
-        ):
-          self.skipTest("require newer libtpu")
+
       if jtu.get_tpu_version() < 5 and axis == 1:
         self.skipTest("sublane gather not supported on old TPUs")
 
@@ -2581,9 +2669,6 @@ class OpsTest(PallasBaseTest):
   def test_bitcast_convert_type_scalar(self):
     self.skip_if_mosaic_gpu()
 
-    if not jtu.is_cloud_tpu_at_least(2026, 3, 29):
-      self.skipTest("Requires a newer libtpu")
-
     x = jnp.int32(42)
     out_dtype = jnp.float32
     out_shape = jax.ShapeDtypeStruct(x.shape, out_dtype)
@@ -2628,7 +2713,7 @@ class OpsTest(PallasBaseTest):
 
     ref = jnp.pad(x, padding, mode=pad_type)
 
-    out_shape = jax.ShapeDtypeStruct(ref.shape, x.dtype)
+    out_shape = jax.ShapeDtypeStruct.like(ref)
     try:
       out = self.pallas_call(
           kernel,
@@ -2734,7 +2819,7 @@ class OpsTest(PallasBaseTest):
 
     @functools.partial(
         self.pallas_call,
-        out_shape=jax.ShapeDtypeStruct(expected.shape, jnp.float32),
+        out_shape=jax.ShapeDtypeStruct.like(expected),
     )
     def kernel(x_ref, out_ref):
       out_ref[...] = jnp.transpose(x_ref[...], axes=transpose_axes)

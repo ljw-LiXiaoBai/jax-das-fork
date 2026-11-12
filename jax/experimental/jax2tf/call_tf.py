@@ -389,7 +389,7 @@ def _get_concrete_function_tf(function_flat_tf, args_flat_sig_tf):  # -> tf.Conc
 
 
 # Mark the effectful instances of call_tf
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class CallTfEffect(effects.Effect):
   __str__ = lambda _: "CallTfEffect"
 
@@ -559,11 +559,10 @@ def _call_tf_lowering(
   # it is in TF graph mode. The `tf.init_scope()` lifts out of function-building
   # graph scopes, and allows us to read the values of the variables
   with tf.init_scope():
-    captured_ops = tuple(
-        mlir.flatten_ir_values(
-            mlir.ir_constant(np.asarray(inp)) for inp in captured_inputs
-        )
-    )
+    captured_ops, _ = mlir.ir_tree_registry.flatten([
+        mlir.ir_constant(np.asarray(inp)) for inp in captured_inputs
+    ])
+    captured_ops = tuple(captured_ops)
 
   if call_tf_graph:
     with jax2tf_internal.inside_call_tf():
@@ -684,9 +683,8 @@ def emit_tf_embedded_graph_custom_call(
   result_avals = ctx.avals_out if ctx.avals_out is not None else ()
 
   operands = list(operands)
-  result_types = list(
-      mlir.flatten_ir_types([mlir.aval_to_ir_type(ctx.module_context, aval) for aval in result_avals])
-  )
+  flat_res_types, _ = mlir.ir_tree_registry.flatten([mlir.aval_to_ir_type(ctx.module_context, aval) for aval in result_avals])
+  result_types = list(flat_res_types)
   if ordered:
     operands.insert(0, ctx.tokens_in.get(call_tf_ordered_effect))
     result_types.insert(0, mlir.token_type())
@@ -708,7 +706,8 @@ def emit_tf_embedded_graph_custom_call(
   results = list(custom_call.results)
   if ordered:
     token = results.pop(0)
-    ctx.set_tokens_out(mlir.TokenSet({call_tf_ordered_effect: token}))
+    ctx.set_tokens_out(ctx.tokens_in.update_tokens(
+        mlir.TokenSet({call_tf_ordered_effect: token})))
 
   return results
 

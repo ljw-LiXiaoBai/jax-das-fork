@@ -64,9 +64,9 @@ def mpmd_map_tracing_context(
   mesh: pallas_core.Mesh,
   other_meshes: tuple[pallas_core.Mesh, ...],
 ) -> Generator[None, None, None]:
-  del mesh  # Will be needed in follow up.
   super_mesh_shape = get_super_mesh_shape(other_meshes)
   with (
+      mesh.tracing_context(),
       jax_core.extend_axis_env_nd(super_mesh_shape.items()),
       config._check_vma(False),
   ):
@@ -114,10 +114,11 @@ def _mpmd_map_abstract_eval(
         # We emit an effect if we have a Ref input that has been written to in
         # the kernel.
         assert not jaxpr.constvars
-        if eff.input_index < len(in_avals) and isinstance(
-            in_avals[eff.input_index], state.AbstractRef
+        index = jaxpr.invars.index(eff.input)
+        if index < len(in_avals) and isinstance(
+            in_avals[index], state.AbstractRef
         ):
-          effs.add(eff)
+          effs.add(eff.replace(index))
         continue
       if not isinstance(eff, jax_core.NamedAxisEffect):
         effs.add(eff)
@@ -256,6 +257,36 @@ def _mpmd_map_dce_rule(
 pe.dce_rules[mpmd_map_p] = _mpmd_map_dce_rule
 
 
+def _mpmd_map_partial_eval_custom(saveable, unks_in, inst_in, eqn):
+  new_inst = [
+      x
+      for x, inst in zip(eqn.invars, inst_in)
+      if type(x) is jax_core.Var and not inst
+  ]
+  num_outs = len(eqn.outvars)
+
+  if not unks_in or any(unks_in):
+    return None, eqn, [True] * num_outs, [True] * num_outs, new_inst
+
+  if any(isinstance(v.aval, state.AbstractRef) for v in eqn.invars):
+    # Force ``mpmd_map`` to run in both forward and backward passes.
+    # Otherwise, partial eval only places the ``mpmd_map`` in the forward
+    # pass, leaving the backward pass to read newly-allocated but *unchanged*
+    # refs.
+    return eqn, eqn, [False] * num_outs, [True] * num_outs, new_inst
+
+  policy = pe.ensure_enum(
+      saveable(eqn.primitive, *[x.aval for x in eqn.invars], **eqn.params)
+  )
+  if isinstance(policy, pe.RecomputeType):
+    return eqn, eqn, [False] * num_outs, [True] * num_outs, new_inst
+  else:
+    return eqn, None, [False] * num_outs, [False] * num_outs, []
+
+
+pe.partial_eval_jaxpr_custom_rules[mpmd_map_p] = _mpmd_map_partial_eval_custom
+
+
 def _mpmd_map_batching_rule(
     axis_data,
     args,
@@ -267,7 +298,7 @@ def _mpmd_map_batching_rule(
     input_output_aliases,
     **params,
 ):
-  if all(d is batching.not_mapped for d in dims):
+  if all(d is None for d in dims):
     out = mpmd_map_p.bind(
         *args,
         jaxprs=jaxprs,
@@ -282,7 +313,7 @@ def _mpmd_map_batching_rule(
     for var, dim in zip(jaxpr.invars[: len(args)], dims):
       if (
           not isinstance(var.aval, state.AbstractRef)
-          and dim is not batching.not_mapped
+          and dim is not None
       ):
         raise ValueError(
             "Closed-over scalar constants cannot be batched. Pass them as"
@@ -297,7 +328,7 @@ def _mpmd_map_batching_rule(
 
   squeezed_args = []
   for arg, dim in zip(args, dims):
-    if dim is batching.not_mapped:
+    if dim is None:
       squeezed_args.append(arg)
     elif isinstance(arg_aval := jax_core.typeof(arg), state.AbstractRef):
       # This is a bit of a hack. We rely on the fact that JAX does not have
@@ -325,7 +356,7 @@ def _mpmd_map_batching_rule(
   )
 
   for arg, squeezed_arg, dim in zip(args, squeezed_args, dims):
-    if dim is batching.not_mapped:
+    if dim is None:
       continue
     if isinstance(jax_core.typeof(arg), state.AbstractRef):
       arg[...] = jnp.expand_dims(jax_core.freeze(squeezed_arg), dim)
@@ -428,7 +459,7 @@ def _mpmd_map_tpu_lowering(
     external_meshes,
 ):
   try:
-    from jax._src.pallas.mosaic import pallas_call_registration
+    from jax._src.pallas.mosaic import pallas_call_registration  # pyrefly: ignore[missing-import]
   except ImportError:
     raise pallas_call._unsupported_lowering_error("tpu")
   num_scratch = len(jaxprs[0].invars) - len(in_nodes) - len(ctx.avals_out)
@@ -554,20 +585,19 @@ def _mpmd_map_fallback_lowering(
 
 @functools.partial(mlir.register_lowering, mpmd_map_p)
 def _mpmd_map_lowering(ctx: mlir.LoweringRuleContext, *in_nodes, **params):
-  return mlir.lower_per_platform(
-      ctx,
-      "mpmd_map",
-      dict(
-          cpu=_mpmd_map_fallback_lowering,
-          tpu=_mpmd_map_tpu_lowering,
-          cuda=_mpmd_map_fallback_lowering,
-          rocm=_mpmd_map_fallback_lowering,
-      ),
-      None,  # default_rule
-      jax_core.no_effects,
-      *in_nodes,
-      **params,
-  )
+  platforms = ctx.module_context.platforms
+  if len(platforms) != 1:
+    raise NotImplementedError(
+        "mpmd_map does not support multi-platform lowering"
+    )
+  [platform] = platforms
+  match platform:
+    case "cpu" | "cuda" | "rocm":
+      return _mpmd_map_fallback_lowering(ctx, *in_nodes, **params)
+    case "tpu":
+      return _mpmd_map_tpu_lowering(ctx, *in_nodes, **params)
+    case _:
+      raise ValueError(f"Unsupported platform: {platform}")
 
 
 def mpmd_map(
@@ -801,7 +831,7 @@ def _mpmd_map(
       # the caller context during tracing).
       # TODO(rdyro): Also check inputs and outputs for core type.
       for scratch_type in flat_scratch_types:
-        from jax._src.pallas.mosaic import core as tpu_core
+        from jax._src.pallas.mosaic import core as tpu_core  # pyrefly: ignore[missing-import]
 
         if not isinstance(
             scratch_type.memory_space, pallas_core.CoreMemorySpace

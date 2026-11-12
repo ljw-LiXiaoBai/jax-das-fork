@@ -74,10 +74,10 @@ jax_multiplatform_test(
         "//jax/_src:shard_map",
         "//jax/experimental:checkify",
         "//jax/experimental:pallas",
-        "//jax/experimental:pallas_gpu",
         "//jax/experimental:pallas_gpu_ops",
         "//jax/experimental:pallas_tpu",
         "//jax/experimental:pallas_tpu_ops",
+        "//jax/experimental:pallas_triton",
     ] + py_deps([
         "numpy",
         "absl/testing",
@@ -276,6 +276,23 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
+    name = "xla_transform_test",
+    srcs = ["xla_transform_test.py"],
+    enable_backends = [
+        "cpu",
+        "tpu",
+    ],
+    deps = [
+        "//jax/extend:xla",
+        "//jaxlib:_xla",
+        "@xla//xla/python:_hlo",
+    ] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
     name = "ffi_test",
     srcs = ["ffi_test.py"],
     enable_configs = [
@@ -294,6 +311,7 @@ jax_multiplatform_test(
     name = "fft_test",
     srcs = ["fft_test.py"],
     backend_tags = {
+        "gpu": ["noasan"],
         "tpu": [
             "noasan",
             "notsan",
@@ -343,6 +361,11 @@ jax_multiplatform_test(
 jax_multiplatform_test(
     name = "lobpcg_test",
     srcs = ["lobpcg_test.py"],
+    backend_tags = {
+        "cpu": [
+            "noasan",
+        ],
+    },
     # Set LOBPCG_EMIT_DEBUG_PLOTS=1 to debug
     # checkLobpcgMonotonicity and checkApproxEigs tests
     # using matplotlib plots
@@ -479,9 +502,6 @@ jax_multiplatform_test(
     backend_tags = {
         "gpu": ["noasan"],  # Memory leaks in NCCL, see https://github.com/NVIDIA/nccl/pull/1143
     },
-    disable_configs = [
-        "gpu_h100x2_tfrt",  # TODO(b/419192167): Doesn't work
-    ],
     enable_backends = ["gpu"],
     tags = [
         "config-cuda-only",
@@ -686,6 +706,7 @@ jax_multiplatform_test(
     name = "lax_numpy_hijax_test",
     srcs = ["lax_numpy_hijax_test.py"],
     backend_tags = {
+        "cpu": ["noasan"],
         "tpu": ["noasan"],  # Times out.
     },
     deps = py_deps([
@@ -930,6 +951,9 @@ jax_multiplatform_test(
 jax_multiplatform_test(
     name = "lax_vmap_op_test",
     srcs = ["lax_vmap_op_test.py"],
+    backend_tags = {
+        "cpu": ["noasan"],
+    },
     shard_count = {
         "cpu": 20,
         "gpu": 20,
@@ -1015,6 +1039,7 @@ jax_multiplatform_test(
     shard_count = 10,
     tags = [
         "noasan",  # Times out under asan.
+        "notsan",  # Times out under tsan.
     ],
     deps = py_deps([
         "absl/testing",
@@ -1101,6 +1126,9 @@ jax_multiplatform_test(
     name = "nn_test",
     srcs = ["nn_test.py"],
     backend_tags = {
+        "cpu": [
+            "noasan",
+        ],
         "gpu": [
             "noasan",  # Times out under asan.
         ],
@@ -1282,6 +1310,15 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
+    name = "random_impl_test",
+    srcs = ["random_impl_test.py"],
+    deps = py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
     name = "random_lax_test",
     srcs = ["random_lax_test.py"],
     backend_tags = {
@@ -1299,7 +1336,7 @@ jax_multiplatform_test(
         "gpu": ["--jax_num_generated_cases=40"],
     },
     shard_count = {
-        "cpu": 20,
+        "cpu": 30,
         "gpu": 50,
         "tpu": 40,
     },
@@ -1489,7 +1526,6 @@ jax_multiplatform_test(
         "cpu_x32": ["--jax_num_generated_cases=30"],
         "gpu_a100": ["--jax_num_generated_cases=40"],
         "gpu_h100": ["--jax_num_generated_cases=40"],
-        "gpu_h100_tfrt": ["--jax_num_generated_cases=40"],
         "gpu_p100": ["--jax_num_generated_cases=40"],
         "gpu_v100": ["--jax_num_generated_cases=40"],
         "tpu_v3": ["--jax_num_generated_cases=40"],
@@ -1558,6 +1594,11 @@ jax_multiplatform_test(
 jax_multiplatform_test(
     name = "checkify_test",
     srcs = ["checkify_test.py"],
+    backend_tags = {
+        "cpu": [
+            "noasan",
+        ],
+    },
     enable_configs = ["tpu_v3_x4"],
     shard_count = {
         "gpu": 2,
@@ -1920,6 +1961,18 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
+    name = "control_deps_test",
+    srcs = ["control_deps_test.py"],
+    tags = ["multiaccelerator"],
+    deps = [
+        "//jax/experimental:control_deps",
+    ] + py_deps([
+        "absl/testing",
+        "numpy",
+    ]),
+)
+
+jax_multiplatform_test(
     name = "async_collectives_test",
     srcs = ["async_collectives_test.py"],
     tags = ["multiaccelerator"],
@@ -1932,9 +1985,6 @@ jax_multiplatform_test(
 jax_multiplatform_test(
     name = "shard_map_test",
     srcs = ["shard_map_test.py"],
-    disable_configs = [
-        "gpu_h100x2_tfrt",  # TODO(b/419192167): Doesn't work
-    ],
     minimal_shard_count = {
         "tpu": 50,
     },
@@ -2243,6 +2293,15 @@ jax_multiplatform_test(
 jax_multiplatform_test(
     name = "scaled_dot_test",
     srcs = ["scaled_dot_test.py"],
+    # This test runs OOM on a part of B200; we overwrite the config to run on the full machine.
+    config_tags_overrides = {
+        "gpu_b200_full": {
+            "manual": False,
+            "notap": False,
+            "disabled": False,
+        },
+    },
+    disable_configs = ["gpu_b200"],
     shard_count = 5,
     deps = py_deps([
         "absl/testing",

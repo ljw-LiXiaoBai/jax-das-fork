@@ -51,12 +51,6 @@ def register_extra_dialect(loader: Callable[[ir.Context], None]):
   _extra_dialect_loaders.append(loader)
 
 
-_MOSAIC_ALLOW_HLO = config.bool_state(
-    name="jax_mosaic_allow_hlo",
-    default=False,
-    help="Allow hlo dialects in Mosaic",
-)
-
 
 # Controls the IR serialization version. Upon incrementing the
 # default version in jaxlib/mosaic/dialect/tpu/transforms/serde.cc we must
@@ -79,6 +73,9 @@ def get_ir_version(ctx: mlir.LoweringRuleContext) -> int | None:
       or is_cloud_tpu_older_than(2026, 5, 5, backend)
   ):
     return _FWD_COMPAT_VERSION
+  # TODO(emilyaf): remove the forward compatibility check after 2026-07-08.
+  if is_cloud_tpu_older_than(2026, 6, 8, backend):
+    return 13
   return None
 
 
@@ -93,7 +90,7 @@ def tpu_custom_call_batcher(axis_data, args, dims, **kwargs):
         "tpu_custom_call does not support non-trivial batching."
     )
   unbatched_args = tuple(
-      a if (d is batching.not_mapped or d is None) else a[d]
+      a if (d is None or d is None) else a[d]
       for a, d in zip(args, dims, strict=True)
   )
   out_unbatched = tpu_custom_call_p.bind(*unbatched_args, **kwargs)
@@ -157,7 +154,7 @@ class Tiling(enum.Enum):
   SPARSE_CORE = "TILING_SPARSE_CORE"
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class CustomCallBackendConfig:
   """Represents an unserialized backend config for custom calls."""
   lowered_module_asm: bytes
@@ -388,7 +385,7 @@ def _tpu_custom_call_lowering(
     input_output_aliases: tuple[tuple[int, int], ...],
     metadata: Any | None,
 ) -> ir.OpResultList:
-  result_types = mlir.flatten_ir_types([mlir.aval_to_ir_types(ctx.module_context, aval) for aval in out_avals])
+  result_types, _ = mlir.ir_tree_registry.flatten([mlir.aval_to_ir_types(ctx.module_context, aval) for aval in out_avals])
   axis_context = ctx.module_context.axis_context
   if isinstance(axis_context, sharding_impls.SPMDAxisContext):
     manual_axes = axis_context.manual_axes | set(axis_context.mesh.manual_axes)
@@ -411,10 +408,10 @@ def _tpu_custom_call_lowering(
   if all(core.is_constant_shape(aval_out.shape) for aval_out in ctx.avals_out):
     result_shapes = None
   else:
-    result_shapes = mlir.flatten_ir_values(
+    result_shapes, _ = mlir.ir_tree_registry.flatten([
         mlir.shape_tensor(ctx.module_context, mlir.eval_dynamic_shape(ctx, aval_out.shape))
         for aval_out in ctx.avals_out
-    )
+    ])
   extra_attributes: dict[str, ir.Attribute] | None = None
   # Add kernel_name and kernel_metadata as attributes to the custom call op.
   # This is because we do not want to pollute the backend_config with this
@@ -470,7 +467,7 @@ def _lower_mosaic_module_to_asm(
   # We'll mutate the module, so clone it
   ctx = module.context
   with ctx, module.operation.location as _:
-    module_op = module.operation.clone()
+    module_op = module.operation.clone(ip=False)
     prev_allow_unregistered_dialects = ctx.allow_unregistered_dialects
     ctx.allow_unregistered_dialects = True
     target_version = (
@@ -627,7 +624,7 @@ def _lower_to_custom_call_config(
     tiling: Tiling | None = None,
 ) -> CustomCallBackendConfig:
   device_type = _get_device_type(module)
-  needs_hlo_passes = _MOSAIC_ALLOW_HLO.value
+  needs_hlo_passes = config.jax_mosaic_allow_hlo.value
   # TC kernels always require layout passes.
   needs_layout_passes = needs_layout_passes or not device_type
   lowered_module_asm, (

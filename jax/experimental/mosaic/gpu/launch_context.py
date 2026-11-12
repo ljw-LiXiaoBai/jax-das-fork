@@ -76,7 +76,7 @@ DEVICE_ID_ATTR = "mosaic_gpu.device_id_load"
 # Attribute used to mark that a kernel requires multicast support
 USES_MULTIMEM_ATTR = "mosaic_gpu.multimem_used"
 # Module attribute used to identify which kernel arguments are used with
-# multimem.
+# multimem or used accross several processes.
 MULTIMEM_ARGS_ATTR = "mosaic_gpu.multimem_args"
 
 
@@ -311,9 +311,6 @@ class TransposeTransform(MemRefTransform):
     return TransposeTransform(
         (*range(leading_rank), *(d + leading_rank for d in self.permutation))
     )
-
-  def to_attr(self) -> ir.Attribute:
-    return mgpu_dialect.TransposeTransformAttr.get(self.permutation)
 
 @dataclasses.dataclass(frozen=True)
 class CollapseLeadingIndicesTransform(MemRefTransform):
@@ -703,6 +700,7 @@ class LaunchContext:
   device_collective_metadata: ir.Value | None = None
   num_peers: int = 0
   num_params: int = 0
+  num_processes: int = 1
   tma_descriptors: dict[
       tuple[ir.Value, tuple[int, ...], int | None, tuple[MemRefTransform, ...], Any, int],
       ir.Value,
@@ -1487,6 +1485,10 @@ class LaunchContext:
     transfer_bytes = c(transfer_bytes_val, i32)
 
     if gather_indices is not None:
+      # Note: Scatters and gathers are handled symmetrically
+      # here. Every mention of "gather" in variable names and the
+      # reasoning below can also be replaced by "scatter" when SMEM is
+      # the source.
       import builtins
       zips = functools.partial(builtins.zip, strict=True)
       # The gather TMA instruction is limited to 2D GMEM references. That means
@@ -1498,17 +1500,13 @@ class LaunchContext:
       # The minor transformed dim should be a contiguous transfer dim.
       # The second minor should be a gather dim of size divisible by 4.
       # The rest can be anything, and we will unroll the transfers over them.
-      if smem_ref is src_ref:
-        raise NotImplementedError("Scatter unsupported for the TMA implementation")
-      assert barrier is not None
-      barrier_ptr = barrier.get_ptr()
       if squeezed_dims:
         raise NotImplementedError("Gather/scatter unsupported when using integer indexing")
       if reduction_op is not None:
         raise ValueError("Gather/scatter TMA can't perform reductions")
       if not isinstance(predicate, _DefaultPredicate):
         raise ValueError("Gather/scatter TMA can't use a predicate")
-      if gather_indices.layout != fa.TMA_GATHER_INDICES_LAYOUT:
+      if gather_indices.layout not in (fa.TMA_INDICES_LAYOUT, fa.TMA_INDICES_4_LAYOUT):
         raise ValueError(f"Unsupported gather indices layout: {gather_indices.layout}")
       ROWS_PER_INSTR = 4
       # Make sure we'll always be accessing SMEM with sufficient alignment.
@@ -1519,10 +1517,11 @@ class LaunchContext:
             f" {single_tma_bits // 8} bytes, but need a multiple of 128 bytes"
         )
 
-      if arrive:
+      if smem_ref is not src_ref and arrive:
+        assert barrier is not None
         arrive_predicate = utils.single_thread_predicate(utils.ThreadSubset.WARPGROUP)
         utils.nvvm_mbarrier_arrive_expect_tx(
-            barrier_ptr,
+            barrier.get_ptr(),
             transfer_bytes,
             predicate=arrive_predicate,
         )
@@ -1540,15 +1539,26 @@ class LaunchContext:
           gmem_ref, (), gmem_peer_id, (1, slice_shape[-1]), swizzle, reduction_op,
       )
 
-      # Indices are split over 4 warps, and replicated within each warp.
-      assert fa.TMA_GATHER_INDICES_LAYOUT.vector_length == ROWS_PER_INSTR
-      # Index 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 ...
-      # Warp  <--- 0 ---> <--- 1 ---> <--- 2 ---> <--- 3 ---> <--- 0 --
-      warp_idx = arith.remui(
-          utils.warp_idx(sync=True),
-          arith.constant(i32, utils.WARPS_IN_WARPGROUP),
-      )
-      gather_linear_idx_warp = arith.muli(warp_idx, c(ROWS_PER_INSTR, i32))
+      assert gather_indices.layout.vector_length == ROWS_PER_INSTR
+      # TMA instructions are uniform, so we can't use multiple lanes.
+      if gather_indices.layout == fa.TMA_INDICES_4_LAYOUT:
+        gather_linear_idx_warp = arith.constant(i32, 0)
+        predicate = utils.single_thread_predicate(utils.ThreadSubset.WARPGROUP)
+        indexing_stride = 1
+        # Note: If we have several tiles here, we could still issue copies from
+        # each warp to increase parallelism, though it's primarily useful for
+        # saving SMEM when loading a small number of long rows.
+      else:
+        # Indices are split over 4 warps, and replicated within each warp.
+        # Index 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 ...
+        # Warp  <--- 0 ---> <--- 1 ---> <--- 2 ---> <--- 3 ---> <--- 0 --
+        warp_idx = arith.remui(
+            utils.warp_idx(sync=True),
+            arith.constant(i32, utils.WARPS_IN_WARPGROUP),
+        )
+        gather_linear_idx_warp = arith.muli(warp_idx, c(ROWS_PER_INSTR, i32))
+        predicate = utils.single_thread_predicate(utils.ThreadSubset.WARP)
+        indexing_stride = utils.WARPS_IN_WARPGROUP
 
       # Since the TMA instruction is limited to 2D gathers, we flatten all
       # non-gather dims into the column index.
@@ -1573,8 +1583,6 @@ class LaunchContext:
           arith.constant(index, 0),
       )
       col_base_offset = arith.index_cast(i32, col_base_offset)
-      # TMA instructions are uniform, so we can't use multiple lanes.
-      predicate = utils.single_thread_predicate(utils.ThreadSubset.WARP)
       # We need to unroll over all non-gather dimensions other than the last one
       non_gather_slice_shape = tuple(
           1 if g else d for d, g in zips(slice_shape[:-1], is_gather_dim[:-1])
@@ -1584,7 +1592,7 @@ class LaunchContext:
         if utils.bitwidth(gather_indices.mlir_dtype) != 32:
           reg = arith.extui(ir.VectorType.get((4,), i32), reg)
         # Compute which rows within the 2D slice we'll be gathering.
-        gather_linear_idx_reg = i * ROWS_PER_INSTR * utils.WARPS_IN_WARPGROUP
+        gather_linear_idx_reg = i * ROWS_PER_INSTR * indexing_stride
         gather_linear_idx = arith.addi(
             gather_linear_idx_warp, arith.constant(i32, gather_linear_idx_reg)
         )
@@ -1618,13 +1626,25 @@ class LaunchContext:
               if not g
           )
           col_offset = arith.addi(col_base_offset, arith.constant(i32, col_slice_offset))
-          llvm.inline_asm(
-              ir.Type.parse("!llvm.void"),
-              [predicate, smem_ptr, tma_desc, barrier_ptr, col_offset, *gather_rows],
-              "@$0 cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes [$1], [$2, {$4, $5, $6, $7, $8}], [$3];",
-              "b,r,l,r" + ",r" * (ROWS_PER_INSTR + 1),
-              has_side_effects=True,
-          )
+          if smem_ref is src_ref:
+            llvm.inline_asm(
+                ir.Type.parse("!llvm.void"),
+                [predicate, tma_desc, smem_ptr, col_offset, *gather_rows],
+                "@$0 cp.async.bulk.tensor.2d.global.shared::cta.tile::scatter4.bulk_group [$1, {$3, $4, $5, $6, $7}], [$2];",
+                "b,l,r" + ",r" * (ROWS_PER_INSTR + 1),
+                has_side_effects=True,
+            )
+          else:
+            assert barrier is not None
+            llvm.inline_asm(
+                ir.Type.parse("!llvm.void"),
+                [predicate, smem_ptr, tma_desc, barrier.get_ptr(), col_offset, *gather_rows],
+                "@$0 cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes [$1], [$2, {$4, $5, $6, $7, $8}], [$3];",
+                "b,r,l,r" + ",r" * (ROWS_PER_INSTR + 1),
+                has_side_effects=True,
+            )
+      if smem_ref is src_ref and arrive:
+        nvvm.cp_async_bulk_commit_group()
       return
 
     assert gather_indices is None  # Only tiled TMA handled below.
@@ -2001,6 +2021,15 @@ class LaunchContext:
     ref_int = llvm.ptrtoint(ir.IntegerType.get_signless(64), ref)
     return arith.subi(ref_int, parameter_address)
 
+  def _mark_parameters_if_multiprocess(self):
+    # All multi-process parameters should be allocated in collective memory.
+    if self.num_processes > 1:
+      parameter_uses_multimem = np.ones(self.num_params, dtype=np.bool)
+
+      self.module.operation.attributes[MULTIMEM_ARGS_ATTR] = (
+          ir.DenseIntElementsAttr.get(parameter_uses_multimem)
+      )
+
   def to_remote(
       self,
       ref: ir.Value,
@@ -2053,6 +2082,8 @@ class LaunchContext:
         raise ValueError(f"peer index must be an i32, got {peer.type}")
       return llvm.call(ref.type, [ref, peer], [], [], callee="nvshmem_ptr")
     else:
+      self._mark_parameters_if_multiprocess()
+
       # Collective metadata contains pointers of kernel arguments for each peer
       # device. The pointer has the following format:
       # [
@@ -2111,16 +2142,20 @@ class LaunchContext:
       return utils.MultimemRef(utils.ptr_as_memref(mc_ptr, result_type))
 
     parameter_id = self._find_kernel_argument_index(ref)
+    # In multiprocess mode, all parameters should be allocated within collective
+    # memory.
     module_attributes = self.module.operation.attributes
-    if MULTIMEM_ARGS_ATTR in module_attributes:
-      parameter_uses_multimem = np.array(module_attributes[MULTIMEM_ARGS_ATTR])
-    else:
-      parameter_uses_multimem = np.zeros(self.num_params, dtype=np.int64)
+    self._mark_parameters_if_multiprocess()
+    if self.num_processes == 1:
+      if MULTIMEM_ARGS_ATTR in module_attributes:
+        parameter_uses_multimem = np.array(module_attributes[MULTIMEM_ARGS_ATTR])
+      else:
+        parameter_uses_multimem = np.zeros(self.num_params, dtype=np.bool)
+      parameter_uses_multimem[parameter_id] = True
 
-    parameter_uses_multimem[parameter_id] = 1
-    module_attributes[MULTIMEM_ARGS_ATTR] = ir.DenseIntElementsAttr.get(
-        parameter_uses_multimem
-    )
+      module_attributes[MULTIMEM_ARGS_ATTR] = ir.DenseIntElementsAttr.get(
+          parameter_uses_multimem
+      )
 
     current_device = self.device_id(on_host)
     parameter_on_current_device = self._get_parameter_address_on_peer(
@@ -2154,6 +2189,8 @@ class LaunchContext:
       self._ensure_nvshmem_decls()
       return cast(ir.Value, llvm.call(i32, [], [], [], callee="nvshmem_my_pe"))
     else:
+      self._mark_parameters_if_multiprocess()
+
       # Rank id is stored as the first element of the collective metadata.
       self.module.operation.attributes[COLLECTIVE_ATTR] = ir.UnitAttr.get()
       rank_offset_constant = arith.constant(ir.IndexType.get(), 0)

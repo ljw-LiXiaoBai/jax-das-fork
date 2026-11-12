@@ -54,7 +54,7 @@ map, unsafe_map = util.safe_map, map
 zip, unsafe_zip = util.safe_zip, zip
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True, weakref_slot=True)
 class _FlatCallback:
   """A Python function callable with flat arguments and results.
 
@@ -475,8 +475,8 @@ def io_callback_batching_rule(
   from jax._src.lax.control_flow.loops import map as lax_map  # pyrefly: ignore[missing-import]
   if ordered:
     raise ValueError("Cannot `vmap` ordered IO callback.")
-  is_batched = [d is not batching.not_mapped for d in dims]
-  new_args = [arg if dim is batching.not_mapped else
+  is_batched = [d is not None for d in dims]
+  new_args = [arg if dim is None else
               batching.moveaxis(arg, dim, 0) for arg, dim in zip(args, dims)]
   unbatched_args, batched_args = util.partition_list(is_batched, new_args)
   def _batch_fun(batched_args):
@@ -515,7 +515,8 @@ def io_callback_lowering(ctx, *args, callback, sharding, ordered, **params):
         returns_token=True,
         sharding=op_sharding,
     )
-    ctx.set_tokens_out(mlir.TokenSet({_OrderedIOEffect: token}))
+    ctx.set_tokens_out(
+        ctx.tokens_in.update_tokens(mlir.TokenSet({_OrderedIOEffect: token})))
   else:
     result, _, _ = emit_python_callback(
         ctx,
@@ -877,7 +878,8 @@ def emit_python_callback(
       # output. Otherwise, the single shardy annotation required of all ops
       # (even those without any results) can annotate the token.
       sharding = SdyArrayList((
-          SdyArray(mesh_shape=(), dim_shardings=(), logical_device_ids=()),
+          SdyArray(mesh_shape=(), dim_shardings=(),
+                   logical_device_ids=sharding.shardings[0].logical_device_ids),
           *sharding.shardings))
     ctx = dataclasses.replace(
         ctx,

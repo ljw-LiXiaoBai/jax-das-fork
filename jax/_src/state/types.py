@@ -48,16 +48,16 @@ class RefEffect(effects.JaxprInputEffect):
   def __eq__(self, other):
     if not isinstance(other, self.__class__):
       return False
-    return self.input_index == other.input_index
+    return self.input == other.input
 
   def __hash__(self):
-    return hash((self.__class__, self.input_index))
+    return hash((self.__class__, self.input))
 
   def _pretty_print(self, context: core.JaxprPpContext) -> pp.Doc:
-    if isinstance(self.input_index, core.Var):
-      index_text = core.pp_var(self.input_index, context)
+    if isinstance(self.input, core.Var):
+      index_text = core.pp_var(self.input, context)
     else:
-      index_text = pp.text(str(self.input_index))
+      index_text = pp.text(str(self.input))
     return pp.concat([
       pp.color(pp.text(self.name), foreground=_ref_effect_color),
       pp.text("<"),
@@ -65,7 +65,7 @@ class RefEffect(effects.JaxprInputEffect):
       pp.text(">")])
 
   def __str__(self):
-    return f"{self.name}<{self.input_index}>"
+    return f"{self.name}<{self.input}>"
 
 class ReadEffect(RefEffect):
   name: str = "Read"
@@ -112,7 +112,7 @@ class MultiRefTransform(Transform):
 
 
 @tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class BitcastTransform(Transform):
   dtype: dtypes.DType = dataclasses.field(metadata=dict(static=True))
 
@@ -162,7 +162,7 @@ def _canonicalize_reshape(
 
 
 @tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class ReshapeTransform(Transform):
   shape: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
 
@@ -201,7 +201,7 @@ def _perm_inverse(permutation: tuple[int, ...]) -> tuple[int, ...]:
 
 
 @tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class TransposeTransform(Transform):
   permutation: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
 
@@ -232,7 +232,7 @@ class TransposeTransform(Transform):
 
 
 @tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class SelectTransform(MultiRefTransform):
   idx: Array | int = dataclasses.field(metadata=dict(static=False))
 
@@ -266,7 +266,7 @@ class SelectTransform(MultiRefTransform):
     return attrs[0]
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class RefIndexer:
   """An object temporarily generated when doing ``ref.at``."""
   ref_or_view: Any
@@ -642,13 +642,6 @@ def _unmap_ref(size, axis, explicit_mesh_axis, ref_aval):
 
 core.aval_mapping_handlers[AbstractRef] = (_map_ref, _unmap_ref)
 
-def get_ref_state_effects(
-    avals: Sequence[core.AbstractValue],
-    effects: core.Effects) -> list[set[StateEffect]]:
-  return [{eff for eff in effects
-           if isinstance(eff, (ReadEffect, WriteEffect, AccumEffect))
-           and eff.input_index == i} for i, _ in enumerate(avals)]
-
 def shaped_array_ref(
     shape: tuple[int, ...], dtype, weak_type: bool = False) -> AbstractRef:
   return AbstractRef(core.ShapedArray(shape, dtype, weak_type=weak_type))
@@ -697,7 +690,7 @@ ad_util.aval_zeros_likers[AbstractRef] = zeros_like_abstract_ref  # pyrefly: ign
 
 # === pinned, chained LinearVals ===
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class AbstractLinVal(core.AbstractValue):
   inner_aval: core.AbstractValue
   memory_space: Any = None
@@ -705,6 +698,3 @@ class AbstractLinVal(core.AbstractValue):
   shape = property(lambda self: self.inner_aval.shape)
   dtype = property(lambda self: self.inner_aval.dtype)
   ndim = property(lambda self: self.inner_aval.ndim)
-
-  def raise_val(self, val): return val
-  def lower_val(self, val): return [val]

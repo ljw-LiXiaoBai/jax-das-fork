@@ -52,10 +52,8 @@ def dot(a: ArrayLike, b: ArrayLike, *,
     stacked rather than broadcast.
 
   Args:
-    a: first input array, of shape ``(..., N)``.
-    b: second input array. Must have shape ``(N,)`` or ``(..., N, M)``.
-      In the multi-dimensional case, leading dimensions must be broadcast-compatible
-      with the leading dimensions of ``a``.
+    a: first input array, of shape ``(*a_batch, N)``.
+    b: second input array. Must have shape ``(N,)`` or ``(*b_batch, N, M)``.
     precision: either ``None`` (default), which means the default precision for
       the backend, a :class:`~jax.lax.Precision` enum value (``Precision.DEFAULT``,
       ``Precision.HIGH`` or ``Precision.HIGHEST``) or a tuple of two
@@ -65,8 +63,10 @@ def dot(a: ArrayLike, b: ArrayLike, *,
       accumulate results to and return a result with that datatype.
 
   Returns:
-    array containing the dot product of the inputs, with batch dimensions of
-    ``a`` and ``b`` stacked rather than broadcast.
+    An array containing the dot product of the inputs.  Unlike :func:`matmul`,
+    the batch dimensions of ``a`` and ``b`` are stacked rather than broadcast;
+    that is, the output shape will be ``(*a_batch,)`` if ``b`` is one-dimensional,
+    or ``(*a_batch, *b_batch, M)`` if ``b`` has more than one dimension.
 
   See also:
     - :func:`jax.numpy.matmul`: broadcasted batched matmul.
@@ -211,6 +211,11 @@ def matmul(a: ArrayLike, b: ArrayLike, *,
   a_batch_dims = (None,) * (num_batch_dims - len(a_batch_dims)) + a_batch_dims
   b_batch_dims = (None,) * (num_batch_dims - len(b_batch_dims)) + b_batch_dims
 
+  a_batch_specs = core.typeof(a).sharding.spec.partitions[:-2] if a_is_mat else ()
+  b_batch_specs = core.typeof(b).sharding.spec.partitions[:-2] if b_is_mat else ()
+  a_batch_specs = (None,) * (num_batch_dims - len(a_batch_specs)) + a_batch_specs
+  b_batch_specs = (None,) * (num_batch_dims - len(b_batch_specs)) + b_batch_specs
+
   # Dimensions to squeeze from the inputs.
   a_squeeze: list[int] = []
   b_squeeze: list[int] = []
@@ -226,30 +231,32 @@ def matmul(a: ArrayLike, b: ArrayLike, *,
   idx_batch: list[int] = []
   idx_a_other: list[int] = []  # other = non-batch, non-contracting.
   idx_b_other: list[int] = []
-  for i, (ba, bb) in enumerate(zip(a_batch_dims, b_batch_dims)):
+  for i, (ba, bb, sa, sb) in enumerate(zip(a_batch_dims, b_batch_dims,
+                                           a_batch_specs, b_batch_specs)):
     if ba is None:
       idx_b_other.append(i)
     elif bb is None:
       idx_a_other.append(i)
     # We generate a cleaner (and more Mosaic-friendly) dot_general by
     # squeezing both and not just treating the B dim as non-contracting below.
-    elif core.definitely_equal(ba, 1) and core.definitely_equal(bb, 1):
+    elif (core.definitely_equal(ba, 1) and core.definitely_equal(bb, 1)
+          and sa is None and sb is None):
       a_squeeze.append(len(idx_batch) + len(idx_a_other) + len(a_squeeze))
       b_squeeze.append(len(idx_batch) + len(idx_b_other) + len(b_squeeze))
       both_squeeze.append(i)
-    elif core.definitely_equal(ba, 1):
+    elif core.definitely_equal(ba, 1) and sa is None:
       idx_b_other.append(i)
       a_squeeze.append(len(idx_batch) + len(idx_a_other) + len(a_squeeze))
-    elif core.definitely_equal(bb, 1):
+    elif core.definitely_equal(bb, 1) and sb is None:
       idx_a_other.append(i)
       b_squeeze.append(len(idx_batch) + len(idx_b_other) + len(b_squeeze))
-    elif core.definitely_equal(ba, bb):
+    elif core.definitely_equal(ba, bb) and sa == sb:
       a_batch.append(len(idx_batch) + len(idx_a_other))
       b_batch.append(len(idx_batch) + len(idx_b_other))
       idx_batch.append(i)
     else:
-      raise ValueError("Incompatible shapes for matmul arguments: {} and {}"
-                       .format(np.shape(a), np.shape(b)))
+      raise ValueError("Incompatible types for matmul arguments: {} and {}"
+                       .format(core.typeof(a), core.typeof(b)))
 
   if a_is_mat:
     idx_a_other.append(num_batch_dims)

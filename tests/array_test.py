@@ -31,12 +31,12 @@ from jax._src.util import safe_zip
 from jax._src.mesh import AxisType, AbstractMesh, Mesh
 from jax._src.sharding import common_devices_indices_map, IndivisibleError
 from jax._src.sharding_impls import (
-    NamedSharding, GSPMDSharding, make_single_device_sharding)
+    NamedSharding, GSPMDSharding, make_single_device_sharding,
+    SingleDeviceSharding)
 from jax.experimental import multihost_utils
 from jax.sharding import PartitionSpec as P
 from jax._src import array
-from jax._src import prng
-from jax._src.lib import jaxlib_extension_version
+from jax._src.random import threefry2x32
 
 
 jax.config.parse_flags_with_absl()
@@ -884,6 +884,8 @@ class JaxArrayTest(jtu.JaxTestCase):
 
   @jtu.with_explicit_mesh((2,), ('x',))
   def test_unreduced_printing(self, mesh):
+    if jtu.test_device_matches(["tpu"]) and not jtu.is_cloud_tpu_at_least(2026, 5, 26):
+      self.skipTest("Requires libtpu built on or after 2026-05-26")
     x = jax.device_put(jnp.arange(8., dtype='float32'), P('x'))
     x = jax.lax.reduce_sum(x, [0], out_sharding=P(unreduced={'x'}))
     self.assertIn('nreduced', str(x.sharding))
@@ -895,6 +897,42 @@ class JaxArrayTest(jtu.JaxTestCase):
     msg = "Implicit conversion of an array to a dtype is deprecated"
     with self.assertDeprecationWarnsOrRaises("jax-array-numpy-dtype", msg, error_class=TypeError):
       np.dtype(x)
+
+  def test_sds_like(self):
+    x = jnp.array(1.)
+    out = jax.ShapeDtypeStruct.like(x)
+    self.assertTrue(out.weak_type)
+    self.assertEqual(out.shape, ())
+    self.assertIsNone(out.sharding)  # uncommitted input
+
+    x = np.array(1.)
+    out = jax.ShapeDtypeStruct.like(x)
+    self.assertFalse(out.weak_type)
+    self.assertEqual(out.shape, ())
+
+    x = jnp.arange(8)
+    out = jax.ShapeDtypeStruct.like(x)
+    self.assertIsNone(out.sharding)  # uncommitted input
+
+    x = jax.device_put(jnp.arange(8), SingleDeviceSharding(jax.devices()[0]))
+    out = jax.ShapeDtypeStruct.like(x)
+    self.assertEqual(out.sharding, SingleDeviceSharding(jax.devices()[0]))
+
+    mesh = jtu.create_mesh((2,), 'x')
+    x = jax.device_put(jnp.arange(8), NamedSharding(mesh, P('x')))
+    out = jax.ShapeDtypeStruct.like(x)
+    self.assertEqual(out.sharding, NamedSharding(mesh, P('x')))
+
+    @jax.jit
+    def f(a):
+      sds = jax.ShapeDtypeStruct.like(a)
+      self.assertEqual(sds.sharding.spec, P('x'))
+      return jnp.ones(sds.shape, sds.dtype, out_sharding=sds.sharding)
+
+    mesh = jtu.create_mesh((2,), 'x', axis_types=(AxisType.Explicit,))
+    x = jax.device_put(jnp.arange(8), NamedSharding(mesh, P('x')))
+    with jax.set_mesh(mesh):
+      f(x)
 
 
 class ShardingTest(jtu.JaxTestCase):
@@ -1037,8 +1075,6 @@ class ShardingTest(jtu.JaxTestCase):
     repr(out.sharding)  # doesn't crash
 
   def test_pspec_tuple(self):
-    if jaxlib_extension_version < 446:
-      self.skipTest('Requires jaxlib_extension_version >= 446')
     pspec = P('x', 'y', 'z')
     self.assertEqual(pspec.index('z'), 2)
     out1 = P(None, 'x', 'y', 'z')
@@ -1348,6 +1384,8 @@ class ShardingTest(jtu.JaxTestCase):
     self.assertEqual(out.sharding.spec, P('a', 'b', None, None))
 
   def test_aval_str_short(self):
+    if jtu.test_device_matches(["tpu"]) and not jtu.is_cloud_tpu_at_least(2026, 5, 26):
+      self.skipTest("Requires libtpu built on or after 2026-05-26")
     mesh = AbstractMesh(
         (2, 2, 2), ('a', 'b', 'c'),
         axis_types=(AxisType.Explicit, AxisType.Explicit, AxisType.Manual))
@@ -1383,6 +1421,8 @@ class ShardingTest(jtu.JaxTestCase):
       mt.varying = {'y'}
 
   def test_modify_spec_auto_unreduced(self):
+    if jtu.test_device_matches(["tpu"]) and not jtu.is_cloud_tpu_at_least(2026, 5, 26):
+      self.skipTest("Requires libtpu built on or after 2026-05-26")
     mesh = AbstractMesh(
         (2, 2, 2), ('a', 'b', 'c'),
         axis_types=(AxisType.Explicit, AxisType.Explicit, AxisType.Auto))
@@ -1407,6 +1447,8 @@ class ShardingTest(jtu.JaxTestCase):
     self.assertEqual(out, P(reduced={'a', 'b'}))
 
   def test_pspec_unreduced(self):
+    if jtu.test_device_matches(["tpu"]) and not jtu.is_cloud_tpu_at_least(2026, 5, 26):
+      self.skipTest("Requires libtpu built on or after 2026-05-26")
     pspec = P('a', 'b', None, unreduced={'c'}, reduced={'d'})
     self.assertEqual(
         repr(pspec),
@@ -1456,9 +1498,8 @@ class ShardingTest(jtu.JaxTestCase):
       P('x', None, 'y', unreduced={'z', 'y'})
 
   def test_named_sharding_unreduced_error(self):
-    if jaxlib_extension_version < 446:
-      self.skipTest('Requires jaxlib_extension_version >= 446')
-
+    if jtu.test_device_matches(["tpu"]) and not jtu.is_cloud_tpu_at_least(2026, 5, 26):
+      self.skipTest("Requires libtpu built on or after 2026-05-26")
     mesh = jtu.create_mesh((1, 1, 1), ('x', 'y', 'z'))
 
     with self.assertRaisesRegex(
@@ -1532,8 +1573,6 @@ class ShardingTest(jtu.JaxTestCase):
       jax.P((('a', 'b'), 'c'))
 
   def test_pspec_subclass_error(self):
-    if jaxlib_extension_version < 446:
-      self.skipTest('Requires jaxlib_extension_version >= 446')
     with self.assertRaisesRegex(TypeError, "Subclassing `jax.P` is prohibited"):
       class MyP(jax.P):
         pass
@@ -1554,7 +1593,7 @@ class RngShardingTest(jtu.JaxTestCase):
   def test_random_bits_is_pure_map_1d(self, num_devices):
     @jax.jit
     def f(x):
-      bits = prng.threefry_random_bits(jnp.array([0, 0], dtype='uint32'),
+      bits = threefry2x32.threefry_random_bits(jnp.array([0, 0], dtype='uint32'),
                                        32, x.shape)
       return bits + x
 
@@ -1588,7 +1627,7 @@ class RngShardingTest(jtu.JaxTestCase):
   def test_random_bits_is_pure_map_2d(self, mesh_shape, pspec):
     @jax.jit
     def f(x):
-      bits = prng.threefry_random_bits(jnp.array([0, 0], dtype='uint32'),
+      bits = threefry2x32.threefry_random_bits(jnp.array([0, 0], dtype='uint32'),
                                        32, x.shape)
       return bits + x
 

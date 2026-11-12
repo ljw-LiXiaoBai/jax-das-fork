@@ -61,9 +61,13 @@ from . import profiler
 from . import tcgen05
 from . import utils
 
-# MLIR can't find libdevice unless we point it to the CUDA path
+# Point Mosaic GPU tools (like nvdisasm) to the CUDA path
 cuda_root = lib.cuda_path or "/usr/local/cuda"
-os.environ["CUDA_ROOT"] = cuda_root
+# TODO(bchetioui): remove once minimum jaxlib version is 0.10.2
+if lib.jaxlib_extension_version < 463:
+  os.environ["CUDA_ROOT"] = cuda_root
+else:
+  os.environ["MOSAIC_GPU_CUDA_ROOT"] = cuda_root
 PYTHON_RUNFILES = os.environ.get("PYTHON_RUNFILES")
 BAZEL_TEST = os.environ.get("BAZEL_TEST", "0")
 
@@ -161,11 +165,6 @@ def is_nvshmem_available():
 def is_single_process_multi_device_topology():
   return (jax.device_count() > 1
           and jax.device_count() == jax.local_device_count())
-
-
-def supports_cross_device_collectives():
-  return ((is_nvshmem_available() and jax.local_device_count() == 1)
-          or is_single_process_multi_device_topology())
 
 
 mosaic_gpu_p = jax_core.Primitive("mosaic_gpu_p")
@@ -271,24 +270,32 @@ def _mosaic_gpu_lowering_rule(
       ),
   )
 
-  if is_multi_device_module and is_single_process_multi_device_topology():
+  # If NVSHMEM is available it will be used by default, otherwise we will use
+  # collective metadata.
+  if is_multi_device_module and (
+      is_single_process_multi_device_topology() or not is_nvshmem_available()
+  ):
     backend_config["xla_replica_ids"] = ir.StringAttr.get(
         ",".join(map(str, replica_ids))
     )
 
     if launch_context.MULTIMEM_ARGS_ATTR in module.operation.attributes:
       multimem_args = np.array(
-          module.operation.attributes[launch_context.MULTIMEM_ARGS_ATTR]
+          ir.DenseIntElementsAttr(
+              module.operation.attributes[launch_context.MULTIMEM_ARGS_ATTR]
+          ),
+          dtype=bool,
       )
       backend_config["multimem_parameters"] = ir.StringAttr.get(
-          ",".join(map(str, multimem_args))
+          ",".join(map(str, map(int, multimem_args)))
       )
 
+  result_types, _ = mlir.ir_tree_registry.flatten([
+      mlir.aval_to_ir_type(ctx.module_context, aval) for aval in ctx.avals_out
+  ])
   return mlir.custom_call(
       call_target_name="mosaic_gpu_v2",
-      result_types=mlir.flatten_ir_types(
-          mlir.aval_to_ir_type(ctx.module_context, aval) for aval in ctx.avals_out
-      ),
+      result_types=result_types,
       operands=args,
       operand_layouts=[list(reversed(range(a.ndim))) for a in ctx.avals_in],
       result_layouts=[list(reversed(range(a.ndim))) for a in ctx.avals_out],
@@ -714,6 +721,7 @@ def _launch(
         device_collective_metadata=device_collective_metadata,
         num_peers=num_peers,
         num_params=num_params,
+        num_processes=jax.process_count(),
     )
     with ctx.named_region("Init"):
       tmem_allocs: list[_TMEMAlloc | _TMEMDialectAlloc] = []
@@ -879,13 +887,17 @@ def _lower_as_gpu_kernel(
       num_params = 0
 
       # Collective metadata parameter is used to lower collective operations
-      # in a single-process setup.
+      # in a single-process setup or in multi-process when nvshmem is not
+      # available.
       if (
           jax_mesh is not None
           and jax_mesh.size > 1
-          and is_single_process_multi_device_topology()
+          and (
+              is_single_process_multi_device_topology()
+              or not is_nvshmem_available()
+          )
       ):
-        num_params = len(arg_refs)
+        num_params = len(arg_refs) + len(inout_ref_tys)
         num_peers = jax_mesh.size
         metadata_ptr = llvm.load(
             ptr_ty, utils.getelementptr(buffers, [num_params], ptr_ty)
@@ -985,15 +997,16 @@ def _kernel_to_module(
   if kernel_name is None:
     kernel_name = jax_util.fun_name(body, "anonymous")
 
-  inout_shape = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype),
-                             inout_shape)
-  out_shape = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype),
-                           out_shape)
+  inout_shape = jax.tree.map(jax.ShapeDtypeStruct.like, inout_shape)
+  out_shape = jax.tree.map(jax.ShapeDtypeStruct.like, out_shape)
+  jax_mesh = mesh_lib.get_concrete_mesh()
+  if jax_mesh.empty:
+    jax_mesh = mesh_lib.thread_resources.env.physical_mesh
   module, out_shape, unwrap_output_tuple, launch_ctx = (
       _lower_as_gpu_kernel(
           body, grid, cluster, block, in_shape, out_shape, inout_shape,
           smem_scratch_shape, thread_semantics, module_name, kernel_name,
-          prof_spec
+          prof_spec, jax_mesh=jax_mesh
       )
   )
 
@@ -1040,9 +1053,6 @@ def as_gpu_kernel(
       body, grid, block, in_shape, out_shape, smem_scratch_shape, prof_spec,
       cluster, module_name, kernel_name, thread_semantics, inout_shape
   )
-
-  if is_device_collective and not supports_cross_device_collectives():
-    raise RuntimeError("Kernel is a cross-device collective but no support is available.")
 
   expected_arg_tys, expected_arg_treedef = jax.tree.flatten((*in_shape, *inout_shape))
   def _check_args(*args):

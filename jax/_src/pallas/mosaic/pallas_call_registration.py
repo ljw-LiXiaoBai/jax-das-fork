@@ -53,7 +53,11 @@ def _get_memory_space_from_aval(
     raise ValueError("Memory spaces not defined for non-ShapedArrays")
   if not isinstance(
       ms := getattr(out_aval, "memory_space", None),
-      (tpu_core.MemorySpace, pallas_core.CoreMemorySpace),
+      (
+          tpu_core.MemorySpace,
+          pallas_core.MemorySpace,
+          pallas_core.CoreMemorySpace,
+      ),
   ):
     return None  # If we are passed a non-TPU memory space, ignore it.
   # If we are passed an aval with an explicit memory space tag, we use it
@@ -73,7 +77,7 @@ def _get_memory_space_from_aval(
           return tpu_custom_call.MemorySpace.SEMAPHORE_MEM
         case _:
           raise ValueError(f"Invalid kernel type for semaphore: {kernel_type}")
-    case tpu_core.MemorySpace.HOST:
+    case pallas_core.MemorySpace.HOST:
       return tpu_custom_call.MemorySpace.HOST
     case pallas_core.CoreMemorySpace(tpu_core.MemorySpace.VMEM, mesh):
       match mesh.core_type:
@@ -204,9 +208,9 @@ def _resolve_tiling(
     mosaic_params: tpu_core.CompilerParams,
     kernel_type: tpu_core.CoreType | None,
 ) -> tpu_custom_call.Tiling | None:
-  if mosaic_params.use_tc_tiling_on_sc is None:
-    return None
   if kernel_type is tpu_core.CoreType.TC:
+    if mosaic_params.use_tc_tiling_on_sc is None:
+      return None
     raise ValueError(
         "use_tc_tiling_on_sc= is not supported for TC kernels"
     )
@@ -214,6 +218,7 @@ def _resolve_tiling(
   return (
       tpu_custom_call.Tiling.COMPACT
       if mosaic_params.use_tc_tiling_on_sc
+      or mosaic_params.use_tc_tiling_on_sc is None
       else tpu_custom_call.Tiling.SPARSE_CORE
   )
 
@@ -263,15 +268,18 @@ def _lower_to_custom_call(
   # This step is required for mapping logical types to physical types.
   # (e.g. PRNG key -> uint32[2])
   physical_avals = [jax_core.physical_aval(aval) for aval in ctx.avals_in]
-  ctx = ctx.replace(avals_in=physical_avals)
+  physical_out_avals = [jax_core.physical_aval(aval) for aval in ctx.avals_out]
+  ctx = ctx.replace(avals_in=physical_avals, avals_out=physical_out_avals)
 
   # Booleans are loaded into the kernel as integers.
   def _maybe_cast_inputs(*args):
     args = [_jax_value_to_mosaic_value(x) for x in args]
     return args
 
-  kernel_in_avals = [_jaxpr_kernel_aval_to_mosaic(x) for x in ctx.avals_in]
-  kernel_out_avals = [_jaxpr_kernel_aval_to_mosaic(x) for x in ctx.avals_out]
+  kernel_in_avals = [_jaxpr_kernel_aval_to_mosaic(x) for x in physical_avals]
+  kernel_out_avals = [
+      _jaxpr_kernel_aval_to_mosaic(x) for x in physical_out_avals
+  ]
   cast_ctx = ctx.replace(avals_out=kernel_in_avals)
   in_nodes = mlir.lower_fun(_maybe_cast_inputs)(cast_ctx, *in_nodes)
 
@@ -390,9 +398,7 @@ def pallas_call_tpu_lowering_rule(
   if axis_context is not None:
     if isinstance(axis_context, sharding_impls.SPMDAxisContext):
       jax_mesh = axis_context.mesh
-  mlir_ctx = mlir.JaxIrContext()
-  mlir_ctx.append_dialect_registry(mlir.upstream_dialects)
-  mlir_ctx.load_all_available_dialects()
+  mlir_ctx = ctx.module_context.context
   tpu.register_dialect(mlir_ctx)
 
   with mlir_ctx, ir.Location.unknown(mlir_ctx):
@@ -577,9 +583,7 @@ def mpmd_map_tpu_lowering_rule(
   if axis_context is not None:
     if isinstance(axis_context, sharding_impls.SPMDAxisContext):
       jax_mesh = axis_context.mesh
-  mlir_ctx = mlir.JaxIrContext()
-  mlir_ctx.append_dialect_registry(mlir.upstream_dialects)
-  mlir_ctx.load_all_available_dialects()
+  mlir_ctx = ctx.module_context.context
   tpu.register_dialect(mlir_ctx)
 
   some_jaxpr = jaxprs[0]

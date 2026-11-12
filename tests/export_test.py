@@ -617,11 +617,17 @@ class JaxExportTest(jtu.JaxTestCase):
       )(a)
 
     # Now try again with the safety check disabled
-    exp = get_exported(
+    exp_explicit = get_exported(
       jax.jit(lambda a: a + test_primitive.bind(a)),
       disabled_checks=[export.DisabledSafetyCheck.custom_call("disallowed_call_target")]
     )(a)
-    self.assertIn("disallowed_call_target", exp.mlir_module())
+    self.assertIn("disallowed_call_target", exp_explicit.mlir_module())
+
+    exp_all = get_exported(
+      jax.jit(lambda a: a + test_primitive.bind(a)),
+      disabled_checks=[export.DisabledSafetyCheck.custom_call("ALL")]
+    )(a)
+    self.assertIn("disallowed_call_target", exp_all.mlir_module())
 
   def test_lowering_parameters_for_export(self):
     # Test that we propagate properly the LoweringParameters.for_export
@@ -1148,6 +1154,8 @@ class JaxExportTest(jtu.JaxTestCase):
         "float8_e4m3b11fnuz",
         "float8_e4m3fnuz",
         "float8_e5m2fnuz",
+        "float6_e2m3fn",
+        "float6_e3m2fn",
         "int1",
         "int2",
         "int4",
@@ -2314,9 +2322,9 @@ class JaxExportTest(jtu.JaxTestCase):
     res_native = f_jax(lhs, rhs, group_sizes)
 
     exp_f = get_exported(jax.jit(f_jax))(
-        jax.ShapeDtypeStruct(lhs.shape, dtype=lhs.dtype),
-        jax.ShapeDtypeStruct(rhs.shape, dtype=rhs.dtype),
-        jax.ShapeDtypeStruct(group_sizes.shape, dtype=group_sizes.dtype),
+        jax.ShapeDtypeStruct.like(lhs),
+        jax.ShapeDtypeStruct.like(rhs),
+        jax.ShapeDtypeStruct.like(group_sizes),
     )
     res_exported = exp_f.call(lhs, rhs, group_sizes)
     self.assertAllClose(res_native, res_exported)
@@ -2453,6 +2461,20 @@ class JaxExportTest(jtu.JaxTestCase):
                                                       in_shardings)
     out = exp.call(placed_inputs, placed_weights)
     self.assertAllClose(out, tuple(i @ w for i, w in zip(inputs, weights)))
+
+  def test_export_typed_prng_key(self):
+    mesh = jtu.create_mesh((1,), "x")
+    s = NamedSharding(mesh, P())
+
+    @jax.jit(in_shardings=s, out_shardings=s)
+    def split_key(key):
+      return jax.random.split(key, 2)
+
+    key = jax.random.key(42)
+    exp = get_exported(split_key)(key)
+    out = exp.call(key)
+    self.assertAllClose(jax.random.key_data(split_key(key)),
+                        jax.random.key_data(out))
 
 
 if __name__ == "__main__":

@@ -34,8 +34,7 @@ from jax._src import test_util as jtu
 from jax._src.config import config
 from jax._src.lib import cuda_versions
 from jax.experimental import multihost_utils
-from jax.experimental import pallas as _pl
-import jax.experimental.mosaic.gpu as mgpu
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as _plgpu
 from jax.experimental.pallas.ops.gpu.all_gather_mgpu import all_gather
 from jax.experimental.pallas.ops.gpu.reduce_scatter_mgpu import reduce_scatter
@@ -47,37 +46,33 @@ P = jax.sharding.PartitionSpec
 partial = functools.partial
 
 
-# We don't want the user to call pl.pallas_call or plgpu.kernel directly, so we
-# monkey patch the functions in `pl` and `plgpu`.
+# We don't want the user to call plgpu.kernel directly, so we monkey patch it
+# in `plgpu`.
 def do_not_call_me_directly(*args, **kwargs):
-  raise RuntimeError(
-      "Use self.{kernel,pallas_call} instead of {plgpu.kernel,pl.pallas_call}."
-  )
+  raise RuntimeError("Use self.kernel instead of plgpu.kernel.")
 
 if TYPE_CHECKING:
-  pl = _pl
   plgpu = _plgpu
 else:
-  # Clone the modules locally because the functions are called from other
+  # Clone the module locally because the functions are called from other
   # other test files in OSS and the tests are not isolated.
-  pl = types.ModuleType("_pl_local")
-  pl.__dict__.update(_pl.__dict__)
-
   plgpu = types.ModuleType("_plgpu_local")
   plgpu.__dict__.update(_plgpu.__dict__)
 
-  _pallas_call = _pl.pallas_call
   _kernel = _plgpu.kernel
-  del _pl, _plgpu
+  del _plgpu
 
   plgpu.kernel = do_not_call_me_directly
-  pl.pallas_call = do_not_call_me_directly
 
 
-def is_nvshmem_used():
+def is_nvshmem_used() -> bool:
   return (
       "XLA_FLAGS" in os.environ
         and "--xla_gpu_experimental_enable_nvshmem" in os.environ["XLA_FLAGS"])
+
+
+def is_multiprocess():
+  return "MULTIPROCESS_TEST" in os.environ
 
 
 def get_reduction_impl(reduction):
@@ -99,14 +94,11 @@ def get_reduction_impl(reduction):
 
 
 _TestCaseBase = (jt_multiprocess.MultiProcessTest
-                 if is_nvshmem_used() is None
+                 if is_multiprocess()
                  else parameterized.TestCase)
 
 
-class MonkeyPatchTest:
-  def test_calling_pallas_call_directly_raises(self):
-    with self.assertRaises(RuntimeError):
-      pl.pallas_call()
+class MonkeyPatchTest(jtu.JaxTestCase):
 
   def test_calling_kernel_directly_raises(self):
     with self.assertRaises(RuntimeError):
@@ -136,11 +128,6 @@ class TestCase(_TestCaseBase, metaclass=PallasTestMetaclass):
     if (not jtu.is_device_cuda() or
         not jtu.is_cuda_compute_capability_at_least("9.0")):
       self.skipTest("Only works on GPU with capability >= sm90")
-    if not mgpu.supports_cross_device_collectives():
-      self.skipTest(
-          "Skip test since cross-device collectives are not supported"
-          " (either NVSHMEM is not available in multi-process mode, or mixed"
-          " mode is used).")
     if os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "") == "platform":
       self.skipTest("NVSHMEM doesn't work with the platform allocator.")
 
@@ -156,15 +143,6 @@ class TestCase(_TestCaseBase, metaclass=PallasTestMetaclass):
   def skip_if_wg_semantics(self):
     if self.is_wg_semantics():
       self.skipTest("Not supported under WG semantics")
-
-  def pallas_call(self, *args, **kwargs):
-    compiler_params = dataclasses.replace(
-        kwargs.pop("compiler_params", plgpu.CompilerParams()),
-        lowering_semantics=self.LOWERING_SEMANTICS,
-    )
-    result = _pallas_call(*args, compiler_params=compiler_params, **kwargs)
-    self.monkey_patched_api_was_used = True
-    return result
 
   def kernel(self, *args, **kwargs):
     compiler_params = dataclasses.replace(
@@ -212,12 +190,10 @@ class PallasCallRemoteDMATest(TestCase):
 
     x = jnp.arange(2 * 8 * 128.0, dtype=jnp.float32).reshape((2 * 8, 128))
     def body(x):
-      return self.pallas_call(
+      return self.kernel(
           kernel,
-          in_specs=[pl.BlockSpec(memory_space=plgpu.GMEM)],
-          out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-          out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
-          scratch_shapes=[
+          out_type=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+          scratch_types=[
               plgpu.SemaphoreType.REGULAR,
               plgpu.SemaphoreType.REGULAR,
           ],
@@ -267,22 +243,18 @@ class PallasCallRemoteDMATest(TestCase):
     def body(x):
       result = x
       for _ in range(25):
-        result = self.pallas_call(
+        result = self.kernel(
             kernel,
-            in_specs=[pl.BlockSpec(memory_space=plgpu.GMEM)],
-            out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-            out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
-            scratch_shapes=[
+            out_type=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+            scratch_types=[
                 plgpu.SemaphoreType.REGULAR,
             ],
         )(result)
 
-        result = self.pallas_call(
+        result = self.kernel(
             different_kernel,
-            in_specs=[pl.BlockSpec(memory_space=plgpu.GMEM)],
-            out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-            out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
-            scratch_shapes=[
+            out_type=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+            scratch_types=[
                 plgpu.SemaphoreType.REGULAR,
                 plgpu.SemaphoreType.REGULAR,
             ],
@@ -321,12 +293,10 @@ class PallasCallRemoteDMATest(TestCase):
 
     x = jnp.arange(2 * 8 * 128.0, dtype=jnp.float32).reshape((2 * 8, 128))
     def body(x):
-      return self.pallas_call(
+      return self.kernel(
           kernel,
-          in_specs=[pl.BlockSpec(memory_space=plgpu.GMEM)],
-          out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-          out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
-          scratch_shapes=[
+          out_type=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+          scratch_types=[
               plgpu.SemaphoreType.REGULAR,
               plgpu.SemaphoreType.REGULAR,
           ],
@@ -369,12 +339,10 @@ class PallasCallRemoteDMATest(TestCase):
       with tempfile.TemporaryDirectory() as tmpdir:
         x = jnp.arange(2 * 8 * 128.0, dtype=jnp.float32).reshape((2 * 8, 128))
         def body(x):
-          return self.pallas_call(
+          return self.kernel(
               kernel,
-              in_specs=[pl.BlockSpec(memory_space=plgpu.GMEM)],
-              out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-              out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
-              scratch_shapes=[
+              out_type=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+              scratch_types=[
                   plgpu.SemaphoreType.REGULAR,
                   plgpu.SemaphoreType.REGULAR,
               ],
@@ -414,12 +382,10 @@ class PallasCallRemoteDMATest(TestCase):
 
     x = jnp.arange(2 * 128.0, dtype=jnp.float32).reshape((2, 128))
     def body(x):
-      return self.pallas_call(
+      return self.kernel(
           kernel,
-          in_specs=[pl.BlockSpec(memory_space=plgpu.GMEM)],
-          out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-          out_shape=jax.ShapeDtypeStruct((1, 128), jnp.float32),
-          scratch_shapes=[
+          out_type=jax.ShapeDtypeStruct((1, 128), jnp.float32),
+          scratch_types=[
               plgpu.SemaphoreType.REGULAR,
               plgpu.SemaphoreType.REGULAR,
           ],
@@ -453,12 +419,10 @@ class PallasCallRemoteDMATest(TestCase):
     x = jnp.zeros((2, 128), dtype=jnp.int32)
     x = x.at[0, 0].set(1)
     def body(x):
-      return self.pallas_call(
+      return self.kernel(
           kernel,
-          in_specs=[pl.BlockSpec(memory_space=plgpu.GMEM)],
-          out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-          out_shape=jax.ShapeDtypeStruct((1, 128), jnp.int32),
-          scratch_shapes=[
+          out_type=jax.ShapeDtypeStruct((1, 128), jnp.int32),
+          scratch_types=[
               plgpu.SemaphoreType.REGULAR,
               plgpu.SemaphoreType.REGULAR,
           ],
@@ -493,12 +457,10 @@ class PallasCallRemoteDMATest(TestCase):
 
     x = jnp.arange(2 * 8 * 128.0, dtype=jnp.float32).reshape((2 * 8, 128))
     def body(x):
-      return self.pallas_call(
+      return self.kernel(
           kernel,
-          in_specs=[pl.BlockSpec(memory_space=plgpu.GMEM)],
-          out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-          out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
-          scratch_shapes=[plgpu.SemaphoreType.REGULAR],
+          out_type=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+          scratch_types=[plgpu.SemaphoreType.REGULAR],
           compiler_params=plgpu.CompilerParams(),
       )(x)
 
@@ -524,11 +486,10 @@ class PallasCallRemoteDMATest(TestCase):
       pl.semaphore_wait(sem)
       y_ref[...] = jnp.ones_like(y_ref)
 
-    kernel_call = self.pallas_call(
+    kernel_call = self.kernel(
         kernel,
-        out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
-        scratch_shapes=[plgpu.SemaphoreType.REGULAR],
+        out_type=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+        scratch_types=[plgpu.SemaphoreType.REGULAR],
         compiler_params=plgpu.CompilerParams(),
     )
 
@@ -553,11 +514,10 @@ class PallasCallRemoteDMATest(TestCase):
       pl.semaphore_wait(sem, 2)
       y_ref[...] = jnp.ones_like(y_ref)
 
-    kernel_call = self.pallas_call(
+    kernel_call = self.kernel(
         kernel,
-        out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
-        scratch_shapes=[plgpu.SemaphoreType.REGULAR],
+        out_type=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+        scratch_types=[plgpu.SemaphoreType.REGULAR],
         compiler_params=plgpu.CompilerParams(),
     )
 
@@ -584,11 +544,10 @@ class PallasCallRemoteDMATest(TestCase):
       pl.semaphore_wait(sem2)
       y_ref[...] = jnp.ones_like(y_ref)
 
-    kernel_call = self.pallas_call(
+    kernel_call = self.kernel(
         kernel,
-        out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
-        scratch_shapes=[plgpu.SemaphoreType.REGULAR] * 2,
+        out_type=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+        scratch_types=[plgpu.SemaphoreType.REGULAR] * 2,
         compiler_params=plgpu.CompilerParams(),
     )
 
@@ -614,14 +573,13 @@ class PallasCallRemoteDMATest(TestCase):
       sem_out_ref[0] = pl.semaphore_read(sem.at[0])
       sem_out_ref[1] = pl.semaphore_read(sem.at[1])
 
-    kernel_call = self.pallas_call(
+    kernel_call = self.kernel(
         kernel,
-        out_specs=[pl.BlockSpec(memory_space=plgpu.GMEM)] * 2,
-        out_shape=(
+        out_type=(
             jax.ShapeDtypeStruct((8, 128), jnp.float32),
             jax.ShapeDtypeStruct((2,), jnp.int32),
         ),
-        scratch_shapes=[plgpu.SemaphoreType.REGULAR((2,))],
+        scratch_types=[plgpu.SemaphoreType.REGULAR((2,))],
         compiler_params=plgpu.CompilerParams(),
     )
 
@@ -667,14 +625,13 @@ class PallasCallRemoteDMATest(TestCase):
       sem_out_ref[0] = pl.semaphore_read(sem.at[0])
       sem_out_ref[1] = pl.semaphore_read(sem.at[1])
 
-    kernel_call = self.pallas_call(
+    kernel_call = self.kernel(
         kernel,
-        out_specs=[pl.BlockSpec(memory_space=plgpu.GMEM)] * 2,
-        out_shape=(
+        out_type=(
             jax.ShapeDtypeStruct((8, 128), jnp.float32),
             jax.ShapeDtypeStruct((2,), jnp.int32),
         ),
-        scratch_shapes=[plgpu.SemaphoreType.REGULAR((2,))],
+        scratch_types=[plgpu.SemaphoreType.REGULAR((2,))],
         compiler_params=plgpu.CompilerParams(),
     )
 
@@ -700,11 +657,10 @@ class PallasCallRemoteDMATest(TestCase):
       pl.semaphore_signal(sem, 1, device_id=other_dev_id)
       pl.semaphore_wait(sem)
 
-    kernel_call = self.pallas_call(
+    kernel_call = self.kernel(
         kernel,
-        out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-        out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
-        scratch_shapes=[plgpu.SemaphoreType.REGULAR],
+        out_type=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+        scratch_types=[plgpu.SemaphoreType.REGULAR],
         compiler_params=plgpu.CompilerParams(),
     )
     mesh = jax.sharding.Mesh(jax.devices()[::-1], ['x'])  # Reverse the devices.
@@ -747,11 +703,10 @@ class PallasCallRemoteDMATest(TestCase):
       pl.semaphore_wait(sem)
 
     transforms = self.default_transforms(dtype=jnp.int32)
-    kernel_call = self.pallas_call(
+    kernel_call = self.kernel(
         kernel,
-        out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-        out_shape=jax.ShapeDtypeStruct((128, 128), jnp.int32),
-        scratch_shapes=[
+        out_type=jax.ShapeDtypeStruct((128, 128), jnp.int32),
+        scratch_types=[
             plgpu.SMEM((128, 128), jnp.int32, transforms=transforms),
             plgpu.SemaphoreType.REGULAR,
         ],
@@ -806,11 +761,10 @@ class PallasCallRemoteDMATest(TestCase):
       pl.semaphore_signal(sem, 1, device_id=(zero, other_dev_id))
       pl.semaphore_wait(sem)
 
-    kernel_call = self.pallas_call(
+    kernel_call = self.kernel(
         kernel,
-        out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-        out_shape=jax.ShapeDtypeStruct(shape, jnp.int32),
-        scratch_shapes=[
+        out_type=jax.ShapeDtypeStruct(shape, jnp.int32),
+        scratch_types=[
             plgpu.SMEM((tile,), jnp.int32),
             plgpu.SemaphoreType.REGULAR,
         ],
@@ -855,11 +809,10 @@ class PallasCallMultimemTest(TestCase):
       pl.semaphore_signal(sem, 1, device_id=other_dev_id)
       pl.semaphore_wait(sem)
 
-    kernel_call = self.pallas_call(
+    kernel_call = self.kernel(
         kernel,
-        out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-        out_shape=jax.ShapeDtypeStruct((128, 128), jnp.int32),
-        scratch_shapes=[plgpu.SemaphoreType.REGULAR],
+        out_type=jax.ShapeDtypeStruct((128, 128), jnp.int32),
+        scratch_types=[plgpu.SemaphoreType.REGULAR],
         compiler_params=plgpu.CompilerParams(),
     )
     mesh = jax.sharding.Mesh(jax.devices()[:2], ["x"])
@@ -886,8 +839,8 @@ class PallasCallMultimemTest(TestCase):
 
     kernel_call = self.kernel(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((1,), jnp.int32),
-        scratch_shapes=[plgpu.SemaphoreType.REGULAR],
+        out_type=jax.ShapeDtypeStruct((1,), jnp.int32),
+        scratch_types=[plgpu.SemaphoreType.REGULAR],
         compiler_params=plgpu.CompilerParams(),
     )
     mesh = jax.sharding.Mesh(jax.devices()[:2], ['x'])
@@ -916,11 +869,10 @@ class PallasCallMultimemTest(TestCase):
       pl.semaphore_wait(sem)
 
     transforms = self.default_transforms(dtype=jnp.int32)
-    kernel_call = self.pallas_call(
+    kernel_call = self.kernel(
         kernel,
-        out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-        out_shape=jax.ShapeDtypeStruct((128, 128), jnp.int32),
-        scratch_shapes=[
+        out_type=jax.ShapeDtypeStruct((128, 128), jnp.int32),
+        scratch_types=[
             plgpu.SMEM((128, 128), jnp.int32, transforms=transforms),
             plgpu.SemaphoreType.REGULAR,
         ],
@@ -964,11 +916,10 @@ class PallasCallMultimemTest(TestCase):
       pl.semaphore_signal(sem, 1, device_id=other_dev_id)
       pl.semaphore_wait(sem)
 
-    kernel_call = self.pallas_call(
+    kernel_call = self.kernel(
         kernel,
-        out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
-        out_shape=jax.ShapeDtypeStruct(shape, jnp.int32),
-        scratch_shapes=[
+        out_type=jax.ShapeDtypeStruct(shape, jnp.int32),
+        scratch_types=[
             plgpu.SMEM(
                 (tile,),
                 jnp.int32,
@@ -1074,12 +1025,10 @@ class PallasCallMultimemTest(TestCase):
     y_shape = jax.ShapeDtypeStruct((64, 32), dtype)
     y = jax.jit(
         jax.shard_map(
-            self.pallas_call(
+            self.kernel(
                 kernel,
-                in_specs=[pl.BlockSpec(memory_space=plgpu.GMEM)],
-                out_specs=pl.BlockSpec(memory_space=plgpu.SMEM),
-                out_shape=y_shape,
-                scratch_shapes=[plgpu.SemaphoreType.REGULAR],
+                out_type=y_shape,
+                scratch_types=[plgpu.SemaphoreType.REGULAR],
                 compiler_params=plgpu.CompilerParams(),
             ),
             mesh=mesh,
@@ -1113,7 +1062,7 @@ class PallasCallMultimemThreadUnsafeTest(TestCase):
       self.skipTest("Not all local devices support multicast")
 
   def test_collective_metadata_with_nvshmem_raises(self):
-    if is_nvshmem_used():
+    if is_multiprocess():
       self.skipTest("This test runs only in single-process mode.")
 
     def kernel(y_ref, sem):
@@ -1127,8 +1076,8 @@ class PallasCallMultimemThreadUnsafeTest(TestCase):
 
     kernel_call = self.kernel(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((128, 128), jnp.int32),
-        scratch_shapes=[plgpu.SemaphoreType.REGULAR],
+        out_type=jax.ShapeDtypeStruct((128, 128), jnp.int32),
+        scratch_types=[plgpu.SemaphoreType.REGULAR],
     )
     mesh = jax.sharding.Mesh(jax.devices()[:2], ["x"])
     f = jax.jit(
@@ -1348,7 +1297,14 @@ class PallasCallMultimemThreadUnsafeTest(TestCase):
     y = multihost_utils.process_allgather(y, tiled=True)
     repeats = [1] * len(x.shape)
     repeats[gather_dimension] = 2
-    np.testing.assert_array_equal(y, np.tile(x, repeats))
+
+    try:
+      np.testing.assert_array_equal(y, np.tile(x, repeats))
+    except Exception:
+      # On some CUDA versions there is a compiler bug where the predicate
+      # on the multimem reduction is not respected.
+      if cuda_versions.cuda_runtime_get_version() not in [12080, 12090, 13000]:
+        raise
 
   @parameterized.parameters(
       (jnp.float32, 1),
@@ -1414,7 +1370,6 @@ class PallasCallMultimemWGTest(
 ):
   ...
 
-
 if __name__ == '__main__':
   # This test doesn't work with the platform allocator, so we override it
   # if it's ran alone. If it's part of a larger test suite and the platform
@@ -1430,6 +1385,8 @@ if __name__ == '__main__':
       )
     else:
       os.environ["XLA_FLAGS"] = additional_xla_flags
+
+  if is_multiprocess():
     jt_multiprocess.main()
   else:
     config.config_with_absl()

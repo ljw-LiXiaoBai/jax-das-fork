@@ -905,15 +905,22 @@ def _tmem_load(tmem_addr, shape, num, pack: bool):
   i32 = ir.IntegerType.get_signless(32)
   num_out_regs, regs_vector = _tmem_access_helper(shape, num)
   pack_mod = ".pack::16b" if pack else ""
+  if num_out_regs == 1:
+    asm_out_ty = i32
+  else:
+    asm_out_ty = llvm.StructType.get_literal([i32] * num_out_regs)
   regs = llvm.inline_asm(
-      llvm.StructType.get_literal([i32] * num_out_regs),
+      asm_out_ty,
       [tmem_addr],
       f"tcgen05.ld.sync.aligned.{shape}.x{num}{pack_mod}.b32 {regs_vector}, [${num_out_regs}];",  # pylint: disable=line-too-long
       "=r," * num_out_regs + "r",
       has_side_effects=True,
   )
   assert isinstance(regs, ir.Value)
-  return [llvm.extractvalue(i32, regs, [i]) for i in range(num_out_regs)]
+  if num_out_regs == 1:
+    return [regs]
+  else:
+    return [llvm.extractvalue(i32, regs, [i]) for i in range(num_out_regs)]
 
 
 def _tmem_store(tmem_addr, shape, num, regs, unpack: bool) -> None:
@@ -954,14 +961,7 @@ class TMEMLayout(fa.TiledLayout):
 
   def cols_in_shape(self, shape: tuple[int, int], bitwidth: int) -> int:
     self.check_type(shape, bitwidth)
-    replication_factor = 1
-    for dim in self.warp_dims:
-      if isinstance(dim, fa.Replicated):
-        replication_factor *= dim.times
-    for dim in self.lane_dims:
-      if isinstance(dim, fa.Replicated):
-        replication_factor *= dim.times
-    return math.prod(shape) * replication_factor // TMEM_ROWS // self.vector_length
+    return math.prod(shape) * self.replication_factor // TMEM_ROWS // self.vector_length
 
   def canonicalize(self) -> TMEMLayout:
     layout = super().canonicalize()
@@ -1026,7 +1026,7 @@ def tmem_default_layout(packing: int = 1) -> TMEMLayout:
 
 def tmem_half_lane_layout(columns, packing: int = 1) -> TMEMLayout:
   """A TMEM layout used for 1CTA MMA with M=64."""
-  if packing > columns or packing.bit_count() != 1:
+  if packing > (columns // 2) or packing.bit_count() != 1:
     raise ValueError(f"Packing must be <= 8 and a power of 2, got: {packing}")
   if columns % 16:
     raise ValueError(f"Columns must be a multiple of 16, got: {columns}")
@@ -1135,10 +1135,7 @@ class TMEMRef:
     return self.layout.vector_length
 
   def __post_init__(self):
-    packed_bitwidth = utils.bitwidth(self.dtype) * self.packing
-    if not packed_bitwidth <= 32:
-      raise ValueError("Expected packed packed bitwidth to be <= 32, but got: "
-                       f"{packed_bitwidth=}")
+    self.layout.check_type(self.shape, utils.bitwidth(self.dtype))
 
   @classmethod
   def from_alloc(
@@ -1169,8 +1166,6 @@ class TMEMRef:
             "collective argument must be provided when TMEM layout is inferred"
         )
       layout = _infer_tmem_layout(shape, collective, packing=1)
-    else:
-      layout.check_type(shape, utils.bitwidth(dtype))
     # TODO: Do we have to do this??
     # warp_idx = utils.warp_idx(sync=False)
     # tmem_addr = arith.ori(tmem_addr, arith.shli(warp_idx, utils.c(21, i32)))
@@ -1179,32 +1174,56 @@ class TMEMRef:
   def slice(self, *idxs) -> TMEMRef:
     i32 = ir.IntegerType.get_signless(32)
     base_idx, slice_shape, is_squeezed = utils.parse_indices(idxs, self.shape)
+    slice_shape = cast(tuple[int, int], tuple(slice_shape))
     if any(is_squeezed):
       raise ValueError("TMEM can only be sliced, not indexed")
-    if base_idx == [0] * len(base_idx) and slice_shape == list(self.shape):
-      return self  # Trival slice
-    if self.layout != tmem_default_layout(packing=self.packing):
-      raise NotImplementedError(
-          "Slicing only implemented for refs with standard layout, got:"
-          f" {self.layout}"
-      )
-    if base_idx[0] != 0 or slice_shape[0] != TMEM_ROWS:
+    if base_idx == [0] * len(base_idx) and slice_shape == self.shape:
+      return self  # Trivial slice
+    # If we slice along rows, or attempt to extract several rows, then we may
+    # end up with a non-contiguous slice of memory.
+    if base_idx[0] != 0 or slice_shape[0] != self.shape[0]:
       raise NotImplementedError("TMEM cannot be sliced along rows")
-    if slice_shape[1] % 8:
+    # If we attempt to extract non-contiguous tiles, then we will end up with a
+    # non-contiguous slice of memory.
+    # We check that we have a single tile along rows. Hence slicing along
+    # columns produces a contiguous slice of memory.
+    if self.shape[0] != self.layout.base_tile_shape[0]:
       raise NotImplementedError(
-          "TMEM column slice length must be a multiple of 8. "
-          f"Got {slice_shape[1]}."
+          "Cannot slice TMEM with multiple tiles along rows."
       )
     col_idx = base_idx[1]
     if not isinstance(col_idx, ir.Value):
+      # TODO(allanrenucci): We should consider performing a similar check on
+      # dynamic values (i.e. using `utils.is_known_divisible`). It currently
+      # breaks many tests though.
+      if col_idx % self.layout.base_tile_shape[1] != 0:
+        raise ValueError(
+            f"Column index ({col_idx}) must be divisible by tile shape column"
+            f" dimension {self.layout.base_tile_shape[1]}"
+        )
       col_idx = arith.constant(i32, col_idx)
     if col_idx.type == ir.IndexType.get():
       col_idx = arith.index_cast(i32, col_idx)
-    if self.packing != 1:
-      col_idx = arith.divui(col_idx, arith.constant(i32, self.packing))
+
+    # The code below converts from a logical column index to a physical column
+    # index.
+    physical_cols_in_tile = self.layout.cols_in_shape(
+        cast(tuple[int, int], self.layout.base_tile_shape),
+        utils.bitwidth(self.dtype),
+    )
+    logical_cols_in_tile = self.layout.base_tile_shape[1]
+    # All branches below are equivalent modulo manual constant folding.
+    if physical_cols_in_tile == logical_cols_in_tile:
+      pass
+    elif physical_cols_in_tile % logical_cols_in_tile == 0:
+      scale_factor = physical_cols_in_tile // logical_cols_in_tile
+      col_idx = arith.muli(col_idx,arith.constant(i32, scale_factor))
+    else:
+      col_idx = arith.muli(col_idx, arith.constant(i32, physical_cols_in_tile))
+      col_idx = arith.divui(col_idx, arith.constant(i32, logical_cols_in_tile))
     return TMEMRef(
         address=arith.addi(self.address, col_idx),
-        shape=cast(tuple[int, int], tuple(slice_shape)),
+        shape=slice_shape,
         layout=self.layout,
         dtype=self.dtype,
     )
@@ -1218,6 +1237,14 @@ class TMEMRef:
     bitwidth = utils.bitwidth(self.dtype)
     has_default_layout = self.layout == tmem_default_layout(packing=packing)
     regs_shape = layout.registers_shape(self.shape)
+    # TODO(olechwierowicz): `sparse_meta_layout()` does not really describe the
+    # actual TMEM layout of the result of `async_copy_sparse_smem_to_tmem`.
+    # As a result storing through SMEM -> Reg -> TMEM is not equivalent to
+    # SMEM -> TMEM. We raise in this case to prevent inconsistent behaviour.
+    # This restriction can be lifted if `TiledLayout` supports multiple
+    # vector dims.
+    if self.layout == sparse_meta_layout():
+      raise NotImplementedError("Sparse meta layout loads unsupported.")
     if regs_shape[0] != 1:  # We'll need to issue multiple loads below.
       raise NotImplementedError("Loading multiple row tiles")
     if layout == LAYOUT and self.layout == tmem_default_layout(packing=packing):
@@ -1226,21 +1253,9 @@ class TMEMRef:
       ).T.reshape(regs_shape)
     elif layout == self.layout.as_tiled_layout() and packing * bitwidth == 32:
       assert len(layout.base_tile_shape) == 2
-      # We could allow replicated dims in the input, but we'd need to divide the
-      # split factor computed below by the replication factor of the input.
-      assert not any(isinstance(d, fa.Replicated) for d in layout.warp_dims)
-      assert not any(isinstance(d, fa.Replicated) for d in layout.lane_dims)
-      warp_split_factor = math.prod(
-          d.times if isinstance(d, fa.Replicated) else 1
-          for d in layout.remove_dimension(1).warp_dims
-      )
-      lane_split_factor = math.prod(
-          d.times if isinstance(d, fa.Replicated) else 1
-          for d in layout.remove_dimension(1).lane_dims
-      )
-      split_factor = warp_split_factor * lane_split_factor
+      cols = math.prod(regs_shape) * packing
       registers = _load_32xcols_native(
-          self.address, self.shape[1] // split_factor, self.dtype, packing, packing
+          self.address, cols, self.dtype, packing, packing
       ).reshape(regs_shape)
     # TODO(apaszke): Support the case where we have a long vector length in the
     # FA more generally, not just for 2x32b.
@@ -1290,6 +1305,14 @@ class TMEMRef:
       )
     if not isinstance(value.layout, fa.TiledLayout):
       raise TypeError(f"Stored array has layout {value.layout}, but TMEM stores expect a TiledLayout")
+    # TODO(olechwierowicz): `sparse_meta_layout()` does not really describe the
+    # actual TMEM layout of the result of `async_copy_sparse_smem_to_tmem`.
+    # As a result storing through SMEM -> Reg -> TMEM is not equivalent to
+    # SMEM -> TMEM. We raise in this case to prevent inconsistent behaviour.
+    # This restriction can be lifted if `TiledLayout` supports multiple
+    # vector dims.
+    if self.layout == sparse_meta_layout():
+      raise NotImplementedError("Sparse meta layout stores unsupported.")
     packing = self.packing
     has_default_layout = self.layout == tmem_default_layout(packing=packing)
     bitwidth = utils.bitwidth(self.dtype)

@@ -30,7 +30,6 @@ limitations under the License.
 #include <string_view>
 #include <tuple>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -721,14 +720,14 @@ jax_triton::TritonAutotunedKernelCall AutotunedKernelCall::ToProto() const {
   // kernel execution. If the kernel is called repeatedly, as we do during
   // auto-tuning, the final result will be junk, so we take a copy of the
   // input to restore after auto-tuning.
-  std::unordered_map<size_t, std::vector<uint8_t>> input_copies;
+  std::vector<std::pair<size_t, std::vector<uint8_t>>> input_copies;
   for (auto [input_idx, output_idx, size] : kernel_call.input_output_aliases_) {
     if (buffers[input_idx] == buffers[output_idx]) {
       std::vector<uint8_t> input_copy(size);
       GPU_RETURN_IF_ERROR(gpuMemcpyDtoHAsync(
           input_copy.data(),
           reinterpret_cast<gpuDevicePtr_t>(buffers[input_idx]), size, stream));
-      input_copies[input_idx] = std::move(input_copy);
+      input_copies.push_back({input_idx, std::move(input_copy)});
     }
   }
 
@@ -821,9 +820,14 @@ void TritonKernelCall(gpuStream_t stream, void** buffers, const char* opaque,
 }
 
 ::xla::ffi::Error TritonKernelCallFfi(gpuStream_t stream,
-                                      std::string_view opaque,
                                       ::xla::ffi::RemainingArgs args,
-                                      ::xla::ffi::RemainingRets rets) {
+                                      ::xla::ffi::RemainingRets rets,
+                                      ::xla::ffi::Dictionary attrs) {
+  auto opaque_attr = attrs.get<std::string_view>("opaque");
+  if (opaque_attr.has_error()) {
+    return opaque_attr.error();
+  }
+  std::string_view opaque = opaque_attr.value();
   std::vector<void*> buffers = CombineBuffers(args, rets);
   auto kernel_call_or = GetKernelCall(opaque, stream, buffers.data());
   if (!kernel_call_or.ok()) {
@@ -840,9 +844,14 @@ void TritonKernelCall(gpuStream_t stream, void** buffers, const char* opaque,
 // For command buffer support, make sure that the kernel cache is populated
 // during initialization.
 ::xla::ffi::Error TritonKernelCallFfiInitialize(gpuStream_t stream,
-                                      std::string_view opaque,
-                                      ::xla::ffi::RemainingArgs args,
-                                      ::xla::ffi::RemainingRets rets) {
+                                                ::xla::ffi::RemainingArgs args,
+                                                ::xla::ffi::RemainingRets rets,
+                                                ::xla::ffi::Dictionary attrs) {
+  auto opaque_attr = attrs.get<std::string_view>("opaque");
+  if (opaque_attr.has_error()) {
+    return opaque_attr.error();
+  }
+  std::string_view opaque = opaque_attr.value();
   std::vector<void*> buffers = CombineBuffers(args, rets);
   auto kernel_call_or = GetKernelCall(opaque, stream, buffers.data());
   if (!kernel_call_or.ok()) {
@@ -856,18 +865,18 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     kTritonKernelCallFfi, TritonKernelCallFfi,
     ::xla::ffi::Ffi::Bind()
         .Ctx<::xla::ffi::PlatformStream<gpuStream_t>>()
-        .Attr<std::string_view>("opaque")
         .RemainingArgs()
-        .RemainingRets(),
+        .RemainingRets()
+        .Attrs(),
     {::xla::ffi::Traits::kCmdBufferCompatible});
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     kTritonKernelCallFfiInitialize, TritonKernelCallFfiInitialize,
     ::xla::ffi::Ffi::BindInitialize()
         .Ctx<::xla::ffi::PlatformStream<gpuStream_t>>()
-        .Attr<std::string_view>("opaque")
         .RemainingArgs()
-        .RemainingRets(),
+        .RemainingRets()
+        .Attrs(),
     {::xla::ffi::Traits::kCmdBufferCompatible});
 
 }  // namespace jax::JAX_GPU_NAMESPACE

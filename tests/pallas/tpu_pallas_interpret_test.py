@@ -576,7 +576,7 @@ class InterpretTest(jtu.JaxTestCase):
     def f(s1, s2, x):
       return pl.pallas_call(
           kernel,
-          out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+          out_shape=jax.ShapeDtypeStruct.like(x),
           grid_spec=pltpu.PrefetchScalarGridSpec(
               num_scalar_prefetch=2,
               grid=(iters,),
@@ -612,7 +612,7 @@ class InterpretTest(jtu.JaxTestCase):
     x = jnp.zeros((4 * 8, 4 * 128))
     y = pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        out_shape=jax.ShapeDtypeStruct.like(x),
         grid=(4, 4),
         in_specs=[
             pl.BlockSpec(block_shape=(8, 128), index_map=lambda i, j: (i, j)),
@@ -659,7 +659,7 @@ class InterpretTest(jtu.JaxTestCase):
     x = jnp.zeros((8, 128), jnp.float32)
     y = pl.pallas_call(
         kernel_without_race,
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        out_shape=jax.ShapeDtypeStruct.like(x),
         in_specs=[pl.BlockSpec(memory_space=hbm_memory_space)],
         scratch_shapes=[
             pltpu.VMEM(x.shape, x.dtype),
@@ -674,7 +674,7 @@ class InterpretTest(jtu.JaxTestCase):
 
     pl.pallas_call(
         kernel_with_race,
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        out_shape=jax.ShapeDtypeStruct.like(x),
         in_specs=[pl.BlockSpec(memory_space=hbm_memory_space)],
         scratch_shapes=[
             pltpu.VMEM(x.shape, x.dtype),
@@ -928,6 +928,37 @@ class InterpretTest(jtu.JaxTestCase):
       y = f(x)
     np.testing.assert_array_equal(y, expected_out)
 
+  def test_core_map_exception_no_hang(self):
+    @pl.kernel(
+        mesh=pltpu.create_tensorcore_mesh('core', num_cores=2),
+        out_type=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+        scratch_types=[pltpu.VMEM((8, 128), jnp.float32),
+                       pltpu.SemaphoreType.REGULAR],
+        interpret=pltpu.InterpretParams())
+    def kernel(x_ref, o_ref, vmem_ref, sem):
+      core_index = jax.lax.axis_index('core')
+      jax.debug.print('core_index: {core_index}', core_index=core_index)
+      @pl.when(core_index == 1)
+      def _():
+        t = vmem_ref[100, 0]
+        vmem_ref[100, 0] = t
+        pl.semaphore_signal(sem, 1, core_index=0)
+
+      @pl.when(core_index == 0)
+      def _():
+        # This wait will never succeed, as the other core raises before
+        # signaling the semaphore.
+        pl.semaphore_wait(sem, 1)
+        pltpu.sync_copy(x_ref, o_ref)
+
+    x = jnp.ones((8, 128), dtype=jnp.float32)
+
+    # TODO(jburnim): Check for 'vmem_ref[0, 0] = vmem_ref[100, 0]' and
+    # 'Out-of-bounds read' in the error message once we can reliably propagate
+    # the original exception out of a thread_map.
+    with self.assertRaises(jax.errors.JaxRuntimeError):
+      kernel(x).block_until_ready()
+
   @parameterized.parameters(pltpu.HBM, pl.ANY)
   def test_hbm_allocation_in_run_scoped_raises(self, hbm_memory_space):
     mesh = pltpu.create_tensorcore_mesh('x', num_cores=1)
@@ -1145,7 +1176,7 @@ class InterpretTest(jtu.JaxTestCase):
       return pl.pallas_call(
           kernel,
           grid=(2,),
-          out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+          out_shape=jax.ShapeDtypeStruct.like(x),
           in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)],
           scratch_shapes=[
               pltpu.VMEM(x.shape, x.dtype),
@@ -1190,7 +1221,7 @@ class InterpretTest(jtu.JaxTestCase):
     y = pl.pallas_call(
         kernel,
         grid=(2,),
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        out_shape=jax.ShapeDtypeStruct.like(x),
         out_specs=pl.BlockSpec(
             (8, 128),
             lambda i: (i, 0),
@@ -1495,7 +1526,7 @@ class InterpretTest(jtu.JaxTestCase):
     def kernel_call(kernel, x, *, in_memory_space, out_memory_space):
       return pl.pallas_call(
           kernel,
-          out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+          out_shape=jax.ShapeDtypeStruct.like(x),
           grid=(1,),
           in_specs=[pl.BlockSpec(memory_space=in_memory_space)],
           out_specs=pl.BlockSpec(memory_space=out_memory_space),
@@ -1600,7 +1631,7 @@ class InterpretTest(jtu.JaxTestCase):
     def kernel_call(x):
       return pl.pallas_call(
           _kernel,
-          out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+          out_shape=jax.ShapeDtypeStruct.like(x),
           grid=(1,),
           out_specs=pl.BlockSpec(memory_space=hbm_memory_space),
           in_specs=[pl.BlockSpec(memory_space=hbm_memory_space)],

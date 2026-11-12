@@ -30,29 +30,31 @@ executable protocols described above.
 """
 from __future__ import annotations
 
-import dataclasses
-import enum
 from collections.abc import Sequence
+import dataclasses
 from dataclasses import dataclass
+import enum
 import itertools as it
 from typing import Any, NamedTuple, Protocol, Union, runtime_checkable
 
-from jax._src import core
 from jax._src import config
+from jax._src import core
 from jax._src import sharding as sharding_lib
 from jax._src import source_info_util
 from jax._src import traceback_util
 from jax._src import tree_util
 from jax._src import util
-from jax._src.typing import ArrayLike
-from jax._src.interpreters import mlir
-from jax._src.layout import Format, Layout, AutoLayoutSingleton
-from jax._src.sharding_impls import UnspecifiedValue
-from jax._src.lib.mlir import ir
-from jax._src.lib import _jax
-from jax._src.lib import xla_client as xc
-from jax._src.tree_util import tree_unflatten, FlatTree
 from jax._src.core import typeof
+from jax._src.interpreters import mlir
+from jax._src.layout import AutoLayoutSingleton, Format, Layout
+from jax._src.lib import _jax
+from jax._src.lib import hlo
+from jax._src.lib import xla_client as xc
+from jax._src.lib.mlir import ir
+from jax._src.sharding_impls import UnspecifiedValue
+from jax._src.mesh import AbstractMesh
+from jax._src.tree_util import FlatTree, tree_unflatten
+from jax._src.typing import ArrayLike
 
 source_info_util.register_exclusion(__file__)
 traceback_util.register_exclusion(__file__)
@@ -258,7 +260,7 @@ class Lowering:
       return mlir.module_to_string(self.stablehlo(),
                                    enable_debug_info=debug_info)
     elif dialect == "hlo":
-      print_opts = xc._xla.HloPrintOptions.short_parsable()
+      print_opts = hlo.HloPrintOptions.short_parsable()
       print_opts.print_metadata = debug_info
       return self.hlo().as_hlo_module().to_string(print_opts)
     else:
@@ -311,7 +313,7 @@ class Lowering:
 
 # -- Public-facing API, plus helpers
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ArgInfo:
   _aval: core.AbstractValue
   donated: bool
@@ -478,11 +480,15 @@ class Traced(Stage):
   def lower(self, *, lowering_platforms: tuple[str, ...] | None = None,
             _private_parameters: mlir.LoweringParameters | None = None):
     """Lower to compiler input, returning a ``Lowered`` instance."""
+    from jax._src.pjit import _resolve_and_lower  # pyrefly: ignore[missing-import]
     lo = self.lojax
     if _private_parameters is None:
       _private_parameters = mlir.LoweringParameters()
     try:
-      from jax._src.pjit import _resolve_and_lower  # pyrefly: ignore[missing-import]
+      ctx_mesh = lo._params['ctx_mesh']
+      if (lowering_platforms is None and isinstance(ctx_mesh, AbstractMesh)
+          and (abd := ctx_mesh.abstract_device) is not None):
+        lowering_platforms = (abd.platform,)
       lowering = _resolve_and_lower(
           lo._meta_tys_flat, **lo._params, lowering_platforms=lowering_platforms,
           lowering_parameters=_private_parameters, pgle_profiler=None)
@@ -968,7 +974,7 @@ class SourceInfo(NamedTuple):
   eqn_name: str
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class DeviceAssignmentMismatch:
   da: Sequence[xc.Device] | int
   m_type: MismatchType

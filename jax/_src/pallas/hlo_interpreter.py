@@ -170,9 +170,9 @@ def kernel_to_hlo_jaxpr(
     assert len(phys_jaxpr.invars) == len(jaxpr.invars)
     scratch_invars = phys_jaxpr.invars[grid_mapping.slice_scratch_ops]
     scratch_avals = [v.aval for v in scratch_invars]
-    discharged_jaxpr, discharged_consts = state_discharge.discharge_state(
-        phys_jaxpr, phys_consts)
-  return discharged_jaxpr, discharged_consts, scratch_avals
+    discharged_closed_jaxpr = state_discharge.discharge_state(
+        jax_core.ClosedJaxpr(phys_jaxpr, phys_consts))
+  return discharged_closed_jaxpr.jaxpr, discharged_closed_jaxpr.consts, scratch_avals
 
 
 def eval_jaxpr_recursive(
@@ -315,14 +315,15 @@ _eval_jaxpr_hop_rules[loops.while_p] = make_hop_rule(
     loops.while_p, 'body_jaxpr', 'cond_jaxpr')
 _eval_jaxpr_hop_rules[conditionals.cond_p] = make_hop_rule(conditionals.cond_p, 'branches')
 def _run_scoped_physicalize_rule(
-    interpreter, *consts, jaxpr: jax_core.Jaxpr, collective_axes):
+    interpreter, *consts, jaxpr: jax_core.Jaxpr, collective_axes, **params):
   if collective_axes:
     raise NotImplementedError(
         "run_scoped interpret rule does not support collective axes"
     )
   physical_jaxpr, physical_consts = interpreter(jaxpr, consts)
   return primitives.run_scoped_p.bind(
-      *physical_consts, jaxpr=physical_jaxpr, collective_axes=collective_axes
+      *physical_consts, jaxpr=physical_jaxpr, collective_axes=collective_axes,
+      **params
   )
 _eval_jaxpr_hop_rules[primitives.run_scoped_p] = _run_scoped_physicalize_rule
 

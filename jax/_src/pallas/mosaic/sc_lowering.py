@@ -14,7 +14,6 @@
 """Lowering for Pallas TPU SparseCore."""
 
 from collections.abc import Sequence
-import dataclasses
 import functools
 from typing import Any, NoReturn, cast
 
@@ -25,6 +24,7 @@ from jax._src import numpy as jnp
 from jax._src import state
 from jax._src import tree_util
 from jax._src import util
+from jax._src.lib import jaxlib_extension_version
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith
 from jax._src.lib.mlir.dialects import memref
@@ -458,27 +458,43 @@ def _dma_start_lowering_rule(
         "`pltpu.async_copy(..., dst_ref=ref.at[iota_ref], ...)`."
     )
   core_index = None
+  subcore_index = None
   if device_id is not None:
     if isinstance(sem_aval.memory_space, pallas_core.CoreMemorySpace):
       dest_mesh = sem_aval.memory_space.mesh
     else:
       dest_mesh = None
-    device_id, core_index = tc_lowering._device_id_to_logical(
+    device_id, core_index, subcore_index = tc_lowering._device_id_to_logical(
         ctx, device_id, device_id_type, device_id_aval, dest_mesh
     )
 
   # If not ``None``, we lower to an indirect DMA instead.
   if indirect_offsets is None:
     def _dma_start(src_ref, dst_ref, sem, src_sem):
-      tpu.enqueue_dma(
-          source=src_ref,
-          target=dst_ref,
-          target_semaphore=sem,
-          source_semaphore=src_sem,
-          device_id=device_id,
-          priority=priority,
-        core_id=core_index,
-      )
+      if jaxlib_extension_version < 462:
+        assert subcore_index is None, (
+            "`subcore_index` is not supported in this version of jaxlib."
+        )
+        tpu.enqueue_dma(
+            source=src_ref,
+            target=dst_ref,
+            target_semaphore=sem,
+            source_semaphore=src_sem,
+            device_id=device_id,
+            priority=priority,
+            core_id=core_index,
+        )
+      else:
+        tpu.enqueue_dma(
+            source=src_ref,
+            target=dst_ref,
+            target_semaphore=sem,
+            source_semaphore=src_sem,
+            device_id=device_id,
+            priority=priority,
+            core_id=core_index,
+            subcore_id=subcore_index,  # pyrefly: ignore[unexpected-keyword]
+        )
       return []
 
     return tc_lowering.lower_with_transformed_refs(
@@ -537,6 +553,7 @@ def _dma_wait_lowering_rule(
       ctx.lowering_context.kernel_type,
   )
   core_id = None
+  subcore_id = None
   if insert_dummy_device:
     i32 = ir.IntegerType.get_signless(32)
     core_id = device_id = arith.constant(i32, ir.IntegerAttr.get(i32, 0))
@@ -545,26 +562,31 @@ def _dma_wait_lowering_rule(
       dest_mesh = sem_aval.memory_space.mesh
     else:
       dest_mesh = None
-    device_id, core_id = tc_lowering._device_id_to_logical(
+    device_id, core_id, subcore_id = tc_lowering._device_id_to_logical(
         ctx, device_id, device_id_type, device_id_aval, dest_mesh
     )
     if core_id:
       raise NotImplementedError(
           "Core index must be None when waiting on a local DMA."
       )
-
+    if subcore_id:
+      raise NotImplementedError(
+          "Subcore index must be None when waiting on a local DMA."
+      )
 
   # If not ``None``, we lower to an indirect DMA instead of a regular DMA.
   if indirect_offsets is None:
-    def _dma_wait(sem, src_ref, dst_ref):
+    def _dma_wait(src_ref, dst_ref, sem):
+      # `wait_dma2` does not support `subcore_id`, so it is ignored until
+      # we migrate to `wait_dma`.
       tpu.wait_dma2(
         sem, src_ref, dst_ref, device_id=device_id, core_id=core_id
       )
       return []
     return tc_lowering.lower_with_transformed_refs(
         _dma_wait,
-        [sem, src_ref, dst_ref],
-        [sem_aval, src_aval, dst_aval],
+        [src_ref, dst_ref, sem],
+        [src_aval, dst_aval, sem_aval],
     )
 
   if device_id is not None:
@@ -708,67 +730,6 @@ def _has_indirect_offsets(
       for indexer, indexer_aval in zip(transforms, transforms_aval)
       if isinstance(indexer, indexing.NDIndexer)
   )
-
-
-@register_lowering_rule(pallas_primitives.jaxpr_call_p)
-def _jaxpr_call_lowering_rule(
-    ctx: LoweringRuleContext,
-    *flat_args,
-    jaxpr: jax_core.Jaxpr,
-    ref_treedefs,
-    program_ids_treedef,
-):
-  args = []
-  flat_ref_avals, _ = util.split_list(
-      ctx.avals_in, [sum(treedef.num_leaves for treedef in ref_treedefs)]
-  )
-  flat_ref_avals = util.split_list(
-      flat_ref_avals,
-      [treedef.num_leaves for treedef in ref_treedefs[: len(ref_treedefs) - 1]],
-  )
-  flat_refs, flat_program_ids = util.split_list(
-      flat_args, [sum(treedef.num_leaves for treedef in ref_treedefs)]
-  )
-  flat_refs = util.split_list(
-      flat_refs,
-      [treedef.num_leaves for treedef in ref_treedefs[: len(ref_treedefs) - 1]],
-  )
-  flat_block_shapes, _ = util.split_list(
-      ctx.block_shapes, [sum(treedef.num_leaves for treedef in ref_treedefs)]
-  )
-  flat_block_shapes = util.split_list(
-      flat_block_shapes,
-      [treedef.num_leaves for treedef in ref_treedefs[: len(ref_treedefs) - 1]],
-  )
-  ref_block_shapes = []
-  for treedef, flat_ref, flat_ref_aval, flat_block_shape in zip(
-      ref_treedefs, flat_refs, flat_ref_avals, flat_block_shapes
-  ):
-    ref = treedef.unflatten(flat_ref)
-    ref_aval = treedef.unflatten(flat_ref_aval)
-    block_shape = treedef.unflatten(flat_block_shape)
-    if isinstance(ref, tuple):
-      # We ignore other transforms here, because they are already embedded
-      # in the jaxpr.
-      ref, transforms = ref
-      ref_aval, _ = ref_aval
-      block_shape, _ = block_shape
-      assert isinstance(ref_aval, state.AbstractRef)
-      ref, block_shape = _transform_ref(ref, ref_aval, block_shape, transforms)
-    ref_block_shapes.append(block_shape)
-    args.append(ref)
-  user_grid_indices = ctx.lowering_context.user_grid_indices
-  assert user_grid_indices is not None
-  program_ids = program_ids_treedef.unflatten(flat_program_ids)
-  for axis, pid in enumerate(program_ids):
-    if pid is None:
-      program_ids[axis] = user_grid_indices[axis]
-  new_lowering_ctx = dataclasses.replace(
-      ctx.lowering_context,
-      block_shapes=tuple(ref_block_shapes),
-      user_grid_indices=program_ids,
-  )
-  return tc_lowering.jaxpr_subcomp(new_lowering_ctx, jaxpr, *args)
 
 
 @register_lowering_rule(jax_core.empty_ref_p)

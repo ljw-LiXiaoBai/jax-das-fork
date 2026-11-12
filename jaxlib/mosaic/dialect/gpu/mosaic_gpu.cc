@@ -476,6 +476,74 @@ llvm::LogicalResult WGMMAOp::verify() {
   return llvm::success();
 }
 
+llvm::LogicalResult MMAOp::inferReturnTypes(
+    mlir::MLIRContext*, std::optional<mlir::Location> location,
+    mlir::ValueRange operands, mlir::DictionaryAttr attributes,
+    mlir::PropertyRef properties, mlir::RegionRange regions,
+    llvm::SmallVectorImpl<mlir::Type>& inferredReturnTypes) {
+  if (operands.empty()) {
+    return mlir::emitOptionalError(location, "expected non-empty operands");
+  }
+  inferredReturnTypes.assign({operands[0].getType()});
+  return mlir::success();
+}
+
+llvm::LogicalResult MMAOp::verify() {
+  auto error = [this](auto... params) {
+    return emitOpError(llvm::formatv(params...));
+  };
+
+  auto a_type = getA().getType();
+  auto b_type = getB().getType();
+  auto acc_type = getAccumulator().getType();
+
+  if (a_type.getElementType() != b_type.getElementType()) {
+    return error("The `a` and `b` inputs must have the same element type.");
+  }
+
+  auto a_shape = a_type.getShape();
+  auto b_shape = b_type.getShape();
+  auto acc_shape = acc_type.getShape();
+
+  int M = acc_shape[0];
+  if (M != a_shape[0]) {
+    return error(
+        "The accumulator's first dimension {0} must be equal to the first "
+        "dimension of `a`: {1}.",
+        M, a_shape[0]);
+  }
+  int K = a_shape[1];
+  if (K != b_shape[0]) {
+    return error(
+        "`a`'s second dimension {0} must be equal to `b`'s first dimension: "
+        "{1}.",
+        K, b_shape[0]);
+  }
+  int N = acc_shape[1];
+  if (N != b_shape[1]) {
+    return error(
+        "The accumulator's second dimension {0} must be equal to the second "
+        "dimension of `b`: {1}.",
+        N, b_shape[1]);
+  }
+
+  auto element_type = a_type.getElementType();
+  auto acc_element_type = acc_type.getElementType();
+  if (mlir::isa<mlir::IntegerType>(element_type)) {
+    if (!acc_element_type.isInteger(32)) {
+      return error("Only i32 accumulator supported for integer operands.");
+    }
+  } else if (mlir::isa<mlir::FloatType>(element_type)) {
+    if (!mlir::isa<mlir::FloatType>(acc_element_type)) {
+      return error("Only float accumulator supported for floating operands.");
+    }
+  } else {
+    return error("Unsupported operand type.");
+  }
+
+  return llvm::success();
+}
+
 llvm::LogicalResult TcGen05MMAOp::verify() {
   auto error = [this](auto... params) {
     return emitOpError(llvm::formatv(params...));
@@ -1182,7 +1250,7 @@ struct HoistReinterpretCastOutOfWarpMap
   mlir::LogicalResult matchAndRewrite(
       WarpMapOp op, mlir::PatternRewriter& rewriter) const override {
     bool modified = false;
-    mlir::Block& body = op->getRegion(0).getBlocks().front();
+    mlir::Block& body = op.getRegion().front();
     for (auto [i, operand, body_operand] :
         llvm::enumerate(op->getOperands(), body.getArguments())) {
       Type user_type = nullptr;
@@ -1199,24 +1267,16 @@ struct HoistReinterpretCastOutOfWarpMap
                 }
                 return false;
               })) {
-        auto rc_op = llvm::cast<ReinterpretCastOp>(*body_operand.user_begin());
-        mlir::IRMapping mapping;
-        mapping.map(rc_op.getOperand(), operand);
+        auto new_cast = ReinterpretCastOp::create(rewriter, op.getLoc(),
+                                                  user_type, operand);
         rewriter.modifyOpInPlace(op, [&]() {
-            op->setOperand(i, rewriter.clone(*rc_op, mapping)->getResult(0));
-            body_operand.setType(user_type);
-          });
-        // Copy the users of the body operand to a vector because we need to
-        // iterate over them twice to avoid invalidating the iterator: once to
-        // replace them with the body operand and once to erase them.
-        std::vector<mlir::Operation*> users_to_erase(
-          body_operand.user_begin(), body_operand.user_end());
-        for (auto user : body_operand.getUsers()) {
-          rewriter.replaceAllUsesWith(llvm::cast<ReinterpretCastOp>(user),
-                                      body_operand);
-        }
-        for (auto user : users_to_erase) {
-          rewriter.eraseOp(user);
+          op->setOperand(i, new_cast);
+          body_operand.setType(user_type);
+        });
+        // Copy the users of the body operand to a vector to avoid invalidating
+        // the iterator while erasing them.
+        for (auto user : llvm::to_vector(body_operand.getUsers())) {
+          rewriter.replaceOp(user, body_operand);
         }
         modified = true;
       }

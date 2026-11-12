@@ -30,6 +30,7 @@ import unittest
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
+from jax._src import config
 from jax._src import test_util as jtu
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -37,7 +38,7 @@ from jax.experimental.pallas import tpu_sc as plsc
 import jax.numpy as jnp
 
 
-jax.config.parse_flags_with_absl()
+config.parse_flags_with_absl()
 
 
 class DebugCheckTest(jtu.JaxTestCase):
@@ -83,7 +84,7 @@ class DebugCheckTest(jtu.JaxTestCase):
       pl.debug_check(True, "Check success!")
       pl.debug_check(False, "Check failure!")
 
-    with pl.enable_debug_checks(), self.assertRaises(
+    with config.jax_pallas_enable_debug_checks(True), self.assertRaises(
         jax.errors.JaxRuntimeError
     ) as error:
       jax.block_until_ready(kernel())
@@ -106,7 +107,7 @@ class DebugCheckTest(jtu.JaxTestCase):
       pl.debug_check(True, "Check success!")
       pl.debug_check(False, "Check failure!")
 
-    with pl.enable_debug_checks(), self.assertRaises(
+    with config.jax_pallas_enable_debug_checks(True), self.assertRaises(
         jax.errors.JaxRuntimeError
     ) as error:
       jax.block_until_ready(kernel())
@@ -124,13 +125,14 @@ class DebugCheckTest(jtu.JaxTestCase):
   def test_trigger_bounds_checker(self, oob):
     size = plsc.get_sparse_core_info().num_lanes
     x = jnp.arange(size, dtype=jnp.int32)
-    indices = jnp.arange(size, dtype=jnp.int32) + jnp.astype(oob, jnp.int32)
+    indices = jnp.arange(size, dtype=jnp.int32) + jnp.astype(oob * 128, jnp.int32)
 
     @pl.kernel(
         out_type=x,
         mesh=plsc.VectorSubcoreMesh(
             core_axis_name="core", subcore_axis_name="subcore", num_cores=1
         ),
+        compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
         scratch_types=dict(
             x_ref=pltpu.VMEM.like(x),
             indices_ref=pltpu.VMEM.like(indices),
@@ -157,7 +159,7 @@ class DebugCheckTest(jtu.JaxTestCase):
       jax.block_until_ready(compiled_kernel(x, indices))
       return
 
-    with pl.enable_debug_checks(), self.assertRaises(
+    with config.jax_pallas_enable_debug_checks(True), self.assertRaises(
         jax.errors.JaxRuntimeError
     ) as error:
       jax.block_until_ready(compiled_kernel(x, indices))

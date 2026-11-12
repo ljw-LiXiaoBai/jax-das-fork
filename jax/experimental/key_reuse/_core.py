@@ -28,7 +28,7 @@ from jax._src import api_util
 from jax._src import core
 from jax._src import linear_util as lu
 from jax._src import pjit
-from jax._src import prng
+from jax._src.random import prng
 from jax._src import random
 from jax._src import source_info_util
 from jax._src import traceback_util
@@ -76,10 +76,12 @@ class _SourceSinkBase:
     assert isinstance(idx, int)
     if isinstance(mask, np.ndarray):
       assert mask.dtype == np.dtype('bool')
-      if np.all(mask):
-        mask = True
-      elif not np.any(mask):
+      if not np.any(mask):
+        # An empty mask (e.g. from vmap over a zero-sized axis) is a no-op:
+        # np.all() is vacuously True for empty arrays, so this must come first.
         mask = False
+      elif np.all(mask):
+        mask = True
       elif mask.flags.writeable:
           mask = np.array(mask, copy=True)
           mask.flags.writeable = False

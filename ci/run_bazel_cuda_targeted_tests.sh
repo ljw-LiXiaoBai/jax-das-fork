@@ -33,6 +33,7 @@
 
 set -euox pipefail
 
+echo "::group::Setup Environment" >&2
 source ci/envs/default.env
 
 if [[ -z "${JAXCI_BAZEL_TARGETS:-}" ]]; then
@@ -74,7 +75,7 @@ bazel_args=(
   --config=hermetic_cuda_umd
   --repo_env=HERMETIC_PYTHON_VERSION="${hermetic_python_version}"
   --repo_env=HERMETIC_CUDNN_VERSION=9.11.0
-  --repo_env=HERMETIC_CUDA_UMD_VERSION=13.0.2
+  --repo_env=HERMETIC_CUDA_UMD_VERSION=13.1.1
   --test_env=XLA_PYTHON_CLIENT_ALLOCATOR=platform
   --test_output=errors
   --strategy=TestRunner=local
@@ -125,8 +126,16 @@ if [[ ${#targets[@]} -eq 0 ]]; then
   echo 'No Bazel targets were provided.'
   exit 1
 fi
+echo "::endgroup::" >&2
 
-bazel test "${bazel_args[@]}" "${targets[@]}" || bazel_retval=$?
+echo "::group::Bazel CUDA targeted tests" >&2
+INVOCATION_ID=$(python3 ci/utilities/generate_invocation_id.py)
 
+bazel test --invocation_id="$INVOCATION_ID" "${bazel_args[@]}" "${targets[@]}" || bazel_retval=$?
+echo "::endgroup::" >&2
+python3 ci/utilities/report_resultstore_link.py "CUDA targeted tests" "$INVOCATION_ID" "${bazel_retval:-0}"
+
+echo "::group::Cleanup" >&2
 ci/utilities/collect_bazel_test_xmls.sh test-artifacts
+echo "::endgroup::" >&2
 exit "${bazel_retval:-0}"

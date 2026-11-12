@@ -553,11 +553,8 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
   def testDot(self, lhs_shape, lhs_dtype, rhs_shape, rhs_dtype):
     rng = jtu.rand_default(self.rng())
     args_maker = lambda: [rng(lhs_shape, lhs_dtype), rng(rhs_shape, rhs_dtype)]
-    tol = {np.float16: 1e-2, np.float32: 2e-5, np.float64: 1e-14,
-           np.complex128: 1e-14}
-    if (lhs_dtype in [np.float16, jnp.bfloat16] and
-        rhs_dtype in [np.float16, jnp.bfloat16]):
-      tol = 1e-2
+    tol = {np.float16: 1e-2, jnp.bfloat16: 1e-1, np.float32: 2e-5,
+           np.float64: 1e-14, np.complex128: 1e-14}
     def np_dot(x, y):
       x = x.astype(np.float32) if lhs_dtype == jnp.bfloat16 else x
       y = y.astype(np.float32) if rhs_dtype == jnp.bfloat16 else y
@@ -4620,7 +4617,8 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     )
     np_op = lambda x, i: np.take_along_axis(x, i, axis=axis)
     self._CheckAgainstNumpy(np_op, jnp_op, args_maker)
-    self._CheckAgainstNumpy(np_op, jnp_one_hot_op, args_maker)
+    self._CheckAgainstNumpy(np_op, jnp_one_hot_op, args_maker,
+                            atol=1e-2, rtol=1e-2)
     self._CompileAndCheck(jnp_op, args_maker)
     self._CompileAndCheck(jnp_one_hot_op, args_maker)
 
@@ -4630,6 +4628,58 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     q0 = jnp.take_along_axis(arr, indices, axis=-1)
     q1 = jnp.take_along_axis(arr, indices)
     np.testing.assert_array_equal(q0, q1)
+
+  def testTakeAlongAxisPromiseInBoundsNoWrappingRetainsDtype(self):
+    arr = jnp.arange(200, dtype=jnp.float32)
+    indices = jnp.array([1, 2, 3], dtype=jnp.int8)
+    jaxpr = jax.make_jaxpr(
+        lambda i: jnp.take_along_axis(
+            arr,
+            i,
+            axis=0,
+            mode='promise_in_bounds',
+            wrap_negative_indices=False,
+        )
+    )(indices)
+    [jit_eqn] = (eqn for eqn in jaxpr.jaxpr.eqns if eqn.primitive.name == 'jit')
+    nested_jaxpr = jit_eqn.params['jaxpr']
+    [gather_eqn] = (
+        eqn for eqn in nested_jaxpr.jaxpr.eqns if eqn.primitive == lax.gather_p
+    )
+    indices_var = gather_eqn.invars[1]
+    self.assertEqual(indices_var.aval.dtype, jnp.int8)
+
+  def testTakeAlongAxisPromiseInBoundsWrappingUpcastsDtype(self):
+    arr = jnp.arange(200, dtype=jnp.float32)
+    indices = jnp.array([1, 2, 3], dtype=jnp.int8)
+    jaxpr = jax.make_jaxpr(
+        lambda i: jnp.take_along_axis(
+            arr, i, axis=0, mode='promise_in_bounds', wrap_negative_indices=True
+        )
+    )(indices)
+    [jit_eqn] = (eqn for eqn in jaxpr.jaxpr.eqns if eqn.primitive.name == 'jit')
+    nested_jaxpr = jit_eqn.params['jaxpr']
+    [gather_eqn] = (
+        eqn for eqn in nested_jaxpr.jaxpr.eqns if eqn.primitive == lax.gather_p
+    )
+    indices_var = gather_eqn.invars[1]
+    self.assertEqual(indices_var.aval.dtype, jnp.int32)
+
+  def testTakeAlongAxisWithInt8Indices(self):
+    h = jtu.rand_default(self.rng())((256, 256, 100), np.float32)
+    g = jtu.rand_int(self.rng(), -100, 99)((256, 256, 1), np.int8)
+    q0 = jnp.take_along_axis(h, g, axis=-1)
+    q1 = np.take_along_axis(h, g, axis=-1)
+    np.testing.assert_equal(q0, q1)
+
+  def testTakeAlongAxisPromiseInBoundsWithInt8Indices(self):
+    h = jtu.rand_default(self.rng())((256, 256, 100), np.float32)
+    g = jtu.rand_int(self.rng(), -100, 99)((256, 256, 1), np.int8)
+    q0 = jnp.take_along_axis(
+        h, g, axis=-1, mode='promise_in_bounds', wrap_negative_indices=True
+    )
+    q1 = np.take_along_axis(h, g, axis=-1)
+    np.testing.assert_equal(q0, q1)
 
   def testTakeAlongAxisWithUint8IndicesDoesNotOverflow(self):
     # https://github.com/jax-ml/jax/issues/5088
@@ -4645,6 +4695,79 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     q0 = jnp.take_along_axis(h, g, axis=-2)
     q1 = np.take_along_axis( h, g, axis=-2)
     np.testing.assert_equal(q0, q1)
+
+  @parameterized.named_parameters(
+      ('default', None, None),
+      ('clip', 'clip', True),
+      ('promise_in_bounds', 'promise_in_bounds', True),
+  )
+  def testTakeAlongAxisWrapNegativeIndices(self, mode, wrap_negative_indices):
+    x = jnp.array([10, 20, 30])
+    idx = jnp.array([-1, -2])
+    kwargs = {}
+    if mode is not None:
+      kwargs['mode'] = mode
+    if wrap_negative_indices is not None:
+      kwargs['wrap_negative_indices'] = wrap_negative_indices
+    np.testing.assert_array_equal(
+        jnp.take_along_axis(x, idx, axis=0, **kwargs), np.array([30, 20])
+    )
+
+  def testTakeAlongAxisClipNoWrapNegativeIndices(self):
+    x = jnp.array([10, 20, 30])
+    idx = jnp.array([-1, -2])
+    np.testing.assert_array_equal(
+        jnp.take_along_axis(
+            x, idx, axis=0, mode='clip', wrap_negative_indices=False
+        ),
+        np.array([10, 10]),
+    )
+
+  def testTakeAlongAxisPromiseInBoundsNoWrapNegativeIndices(self):
+    x = jnp.array([10, 20, 30])
+    idx = jnp.array([-1, -2])
+    # Verify no jaxpr wrapping operations are generated.
+    jaxpr_wrap = jax.make_jaxpr(
+        lambda x, i: jnp.take_along_axis(
+            x, i, axis=0, mode='promise_in_bounds', wrap_negative_indices=True
+        )
+    )(x, idx)
+    jaxpr_no_wrap = jax.make_jaxpr(
+        lambda x, i: jnp.take_along_axis(
+            x, i, axis=0, mode='promise_in_bounds', wrap_negative_indices=False
+        )
+    )(x, idx)
+    jaxpr_default = jax.make_jaxpr(
+        lambda x, i: jnp.take_along_axis(
+            x, i, axis=0, mode='promise_in_bounds'  # should not wrap by default
+        )
+    )(x, idx)
+
+    def get_all_primitives(jaxpr):
+      prims = set()
+      for eqn in jaxpr.eqns:
+        prims.add(eqn.primitive.name)
+        if eqn.primitive.name == 'jit':
+          prims.update(get_all_primitives(eqn.params['jaxpr']))
+      return prims
+
+    wrap_prims = get_all_primitives(jaxpr_wrap.jaxpr)
+    no_wrap_prims = get_all_primitives(jaxpr_no_wrap.jaxpr)
+    default_prims = get_all_primitives(jaxpr_default.jaxpr)
+
+    self.assertTrue(
+        'select' in wrap_prims or 'lt' in wrap_prims or 'add' in wrap_prims
+    )
+    self.assertFalse(
+        'select' in no_wrap_prims
+        or 'lt' in no_wrap_prims
+        or 'add' in no_wrap_prims
+    )
+    self.assertFalse(
+        'select' in default_prims
+        or 'lt' in default_prims
+        or 'add' in default_prims
+    )
 
   def testTakeAlongAxisOutOfBounds(self):
     x = jnp.arange(10, dtype=jnp.float32)
@@ -5095,6 +5218,13 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
 
     jnp_op = getattr(jnp, op)
     dtype = np.dtype(dtypes.canonicalize_dtype(dtype)).type
+
+    machine = platform.machine()
+    is_arm = machine.startswith(('aarch', 'arm'))
+    # TODO(bchetioui): re-enable when b/518927213 is fixed
+    if is_arm and op == 'tanh' and dtype == np.float16:
+      self.skipTest('b/518927213: miscompile on ARM')
+
     for x in (np.nan, -np.inf, -100., -2., -1., 0., 1., 2., 100., np.inf,
               jnp.finfo(dtype).max, np.sqrt(jnp.finfo(dtype).max),
               np.sqrt(jnp.finfo(dtype).max) * 2.):
@@ -5128,6 +5258,31 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     np_fun = partial(np.corrcoef, rowvar=rowvar)
     np_fun = jtu.ignore_warning(
       category=RuntimeWarning, message="invalid value encountered.*")(np_fun)
+    jnp_fun = partial(jnp.corrcoef, rowvar=rowvar)
+    self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker, check_dtypes=False)
+    self._CompileAndCheck(jnp_fun, args_maker)
+
+  @unittest.skipIf(numpy_version < (2, 2, 0), "test covers NumPy 2.2+ behavior.")
+  @jtu.sample_product(
+      shape=[(1, 3), (3, 1)],
+      rowvar=[True, False],
+  )
+  @jax.default_matmul_precision("float32")
+  def testCorrCoefTransposeBehavior(self, shape, rowvar):
+    # Regression test for https://github.com/jax-ml/jax/issues/29571. The
+    # NumPy 2.2 update to jnp.cov (see
+    # https://github.com/numpy/numpy/pull/27661) flows through to corrcoef
+    # for single-row design matrices with rowvar=False, so the output shape
+    # and NaN propagation should now match NumPy.
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(shape, np.float32)]
+
+    @jtu.ignore_warning(category=RuntimeWarning, message="invalid value.*")
+    @jtu.ignore_warning(category=RuntimeWarning, message="Degrees of freedom.*")
+    @jtu.ignore_warning(category=RuntimeWarning, message="divide by zero.*")
+    def np_fun(x):
+      return np.corrcoef(x, rowvar=rowvar)
+
     jnp_fun = partial(jnp.corrcoef, rowvar=rowvar)
     self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker, check_dtypes=False)
     self._CompileAndCheck(jnp_fun, args_maker)

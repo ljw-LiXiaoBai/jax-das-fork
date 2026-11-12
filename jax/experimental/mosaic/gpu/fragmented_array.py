@@ -530,23 +530,17 @@ class TiledLayout:
       dim_offsets = [o - 1 for o in dim_offsets]  # We inserted an extra dim.
     else:
       new_vector_dim = self.vector_dim + dim_offsets[self.vector_dim]
-    def replace_tiled_dim(d: int | Replicated, size: int):
+    def replace_tiled_dim(d: int | Replicated):
       if isinstance(d, Replicated):
         return d
       elif removed_dim[d]:
-        return Replicated(size)
+        return Replicated(tiled_shape[d])
       else:
         return d + dim_offsets[d]
     return TiledLayout(
         new_tiling,
-        tuple(
-            d if isinstance(d, Replicated) else replace_tiled_dim(d, tiled_shape[d])
-            for d in self.warp_dims
-        ),
-        tuple(
-            d if isinstance(d, Replicated) else replace_tiled_dim(d, tiled_shape[d])
-            for d in self.lane_dims
-        ),
+        tuple(replace_tiled_dim(d) for d in self.warp_dims),
+        tuple(replace_tiled_dim(d) for d in self.lane_dims),
         new_vector_dim,
         _check_canonical=False,
     ).canonicalize()
@@ -611,6 +605,17 @@ class TiledLayout:
         replace_tiled_dim(self.vector_dim),
         _check_canonical=False,
     )
+
+  @property
+  def replication_factor(self) -> int:
+    replication_factor = 1
+    for dim in self.warp_dims:
+      if isinstance(dim, Replicated):
+        replication_factor *= dim.times
+    for dim in self.lane_dims:
+      if isinstance(dim, Replicated):
+        replication_factor *= dim.times
+    return replication_factor
 
 
 def _tiled_wgmma_layout(shape: tuple[int, ...]):
@@ -942,13 +947,20 @@ TMEM_NATIVE_LAYOUT = tmem_native_layout(2)
 # A layout for the row indices used by TMA gather4/scatter4 instructions.
 # Index 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 ...
 # Warp  <--- 0 ---> <--- 1 ---> <--- 2 ---> <--- 3 ---> <--- 0 --
-TMA_GATHER_INDICES_LAYOUT = TiledLayout(
+TMA_INDICES_LAYOUT = TiledLayout(
     Tiling(((16,), (4,))),
     warp_dims=(-2,),
     lane_dims=(Replicated(32),),
     vector_dim=-1,
 )
 
+# A replicated layout for TMA indices where every thread holds the same indices.
+TMA_INDICES_4_LAYOUT = TiledLayout(
+    Tiling(((4,),)),
+    warp_dims=(Replicated(4),),
+    lane_dims=(Replicated(32),),
+    vector_dim=-1,
+)
 
 def can_relayout_wgmma_4x_to_wgmma_2x(bitwidth: int) -> bool:
   return bitwidth == 4
@@ -1650,7 +1662,7 @@ class FragmentedArray:
   def __lshift__(self, other):
     if not isinstance(self.mlir_dtype, ir.IntegerType):
       return NotImplemented
-    return self._pointwise(arith.shli, other, restrict_bitwidth=False)
+    return self._pointwise(arith.shli, other)
 
   def __rshift__(self, other):
     if not isinstance(self.mlir_dtype, ir.IntegerType):
@@ -1658,7 +1670,6 @@ class FragmentedArray:
     return self._pointwise(
         arith.shrsi if self.is_signed else arith.shrui,
         other,
-        restrict_bitwidth=False,
     )
 
   def __eq__(self, other):

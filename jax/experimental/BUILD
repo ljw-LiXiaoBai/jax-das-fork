@@ -21,8 +21,8 @@ load(
     "mosaic_gpu_internal_users",
     "mosaic_internal_users",
     "pallas_fuser_users",
-    "pallas_gpu_internal_users",
     "pallas_sc_internal_users",
+    "pallas_triton_internal_users",
     "py_deps",
     "py_library_providing_imports_info",
     "pytype_strict_library",
@@ -67,9 +67,9 @@ package_group(
 )
 
 package_group(
-    name = "pallas_gpu_users",
+    name = "pallas_triton_users",
     includes = ["//jax:internal"],
-    packages = pallas_gpu_internal_users,
+    packages = pallas_triton_internal_users,
 )
 
 package_group(
@@ -159,6 +159,14 @@ pytype_strict_library(
     deps = [
         "//jax/_src:compute_on",
     ],
+)
+
+pytype_strict_library(
+    name = "control_deps",
+    srcs = ["control_deps.py"],
+    type_checking = "pyrefly",
+    visibility = ["//visibility:public"],
+    deps = ["//jax"],
 )
 
 pytype_strict_library(
@@ -389,26 +397,15 @@ pytype_strict_library(
 )
 
 pytype_strict_library(
-    name = "pallas_gpu",
-    visibility = [
-        ":pallas_gpu_users",
-    ],
-    deps = [
-        ":pallas_triton",
-        # TODO(slebedev): Add :pallas_mosaic_gpu once it is ready.
-    ],
-)
-
-pytype_strict_library(
     name = "pallas_gpu_ops",
     srcs = ["//jax/experimental/pallas/ops/gpu:triton_ops"],
     type_checking = "pyrefly",
     visibility = [
-        ":pallas_gpu_users",
+        ":pallas_triton_users",
     ],
     deps = [
         ":pallas",
-        ":pallas_gpu",
+        ":pallas_triton",
         "//jax",
         "//jax/_src:lax",
     ] + py_deps("numpy"),
@@ -511,7 +508,7 @@ pytype_strict_library(
     ],
     type_checking = "pyrefly",
     visibility = [
-        ":pallas_gpu_users",
+        ":pallas_triton_users",
     ],
     deps = [
         "//jax/_src:deprecations",

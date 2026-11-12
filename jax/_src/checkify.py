@@ -41,6 +41,7 @@ from jax._src import source_info_util
 from jax._src import traceback_util
 from jax._src import tree_util as jtu
 from jax._src.ad_util import SymbolicZero
+from jax._src.hijax import call_hi_primitive_p
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
@@ -100,7 +101,7 @@ class JaxException(Exception):
 
 
 @functools.total_ordering
-@dataclasses.dataclass(eq=True, frozen=True)
+@dataclasses.dataclass(eq=True, frozen=True, slots=True)
 class ErrorEffect(effects.Effect):
   error_type: type[JaxException]
   shape_dtypes: tuple[api.ShapeDtypeStruct, ...]
@@ -193,7 +194,7 @@ class FailedCheckError(JaxException):
     vals = jtu.tree_leaves((self.args, self.kwargs))
     return ErrorEffect(
         FailedCheckError,
-        tuple(api.ShapeDtypeStruct(x.shape, x.dtype) for x in vals))
+        tuple(api.ShapeDtypeStruct.like(x) for x in vals))
 
 @dataclasses.dataclass
 class BatchedError(JaxException):
@@ -212,7 +213,7 @@ class BatchedError(JaxException):
 # Error Value
 
 @jtu.register_pytree_node_class
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class Error:
   _pred: dict[ErrorEffect, Bool]
   _code: dict[ErrorEffect, Int]
@@ -536,7 +537,7 @@ mlir.register_lowering(check_p, check_lowering_rule,
 
 def check_batching_rule(batched_args, batch_dims, *, err_tree, debug):
   size = next(x.shape[dim] for x, dim in zip(batched_args, batch_dims)
-              if dim is not batching.not_mapped)
+              if dim is not None)
   batched_args = (batching.bdim_at_front(a, d, size)
                   for a, d in zip(batched_args, batch_dims))
   err = tree_unflatten(err_tree, batched_args)
@@ -949,6 +950,22 @@ def remat_error_check(error, enabled_errors, *vals_in, jaxpr, **params):
 error_checks[ad_checkpoint.remat_p] = remat_error_check
 
 
+def call_hi_primitive_error_check(error, enabled_errors, *vals_in, _prim):
+  if not isinstance(_prim, ad_checkpoint.RematTraced):
+    return default_checkify_rule(call_hi_primitive_p, error, enabled_errors,
+                                 *vals_in, _prim=_prim)
+  err_vals, err_tree = jtu.tree_flatten(error)
+  new_vals_in = [*err_vals, *vals_in]
+  in_avals = tuple(map(core.typeof, new_vals_in))
+  checked_jaxpr_, out_tree, _ = jaxpr_to_checkify_jaxpr(
+      _prim.jaxpr, enabled_errors, err_tree, *in_avals)
+  checked_jaxpr, consts = pe.separate_consts(checked_jaxpr_)
+  new_prim = ad_checkpoint.RematTraced(checked_jaxpr, _prim.policy)
+  err_and_out = new_prim(*consts, *new_vals_in)
+  return tree_unflatten(out_tree, err_and_out)
+error_checks[call_hi_primitive_p] = call_hi_primitive_error_check
+
+
 def shard_map_error_check(
     error: Error, enabled_errors, *vals_in,
     jaxpr: core.Jaxpr, in_specs, out_specs, **kwargs
@@ -962,7 +979,7 @@ def shard_map_error_check(
   new_in_specs = (*([P()] * num_error_vals), *in_specs)
   new_vals_in = [*err_vals, *vals_in]
   in_avals = list(map(core.typeof, new_vals_in))
-  manual_axes = kwargs.get('manual_axes')
+  manual_axes = kwargs.get('newly_manual_axes')
   check_vma = kwargs.get('check_vma')
   for i, v in enumerate(in_avals):
     if not (sharder := core.shard_aval_handlers.get(type(v))):

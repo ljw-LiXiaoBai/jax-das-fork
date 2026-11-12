@@ -45,7 +45,6 @@ from jax._src.lax import lax
 from jax._src.lax import slicing
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo
-from jax._src.lib import xla_client as xc
 from jax._src.typing import Array
 from jax._src.util import (canonicalize_axis, moveaxis, safe_map, safe_zip,
                            unzip2)
@@ -324,12 +323,12 @@ def _canonicalize_axis_index_groups(axis_index_groups):
 def pbroadcast(x, axis_name, source):
   """Perform a collective broadcast and replicate from ``source``.
 
-  This is equivalent to
-  ```
-  def pbroadcast(x, axis_name, source):
-    masked = jnp.where(axis_index(axis_name) == source, x, zeros_like(x))
-    return psum(masked, axis_name)
-  ```
+  This is equivalent to::
+
+    def pbroadcast(x, axis_name, source):
+      masked = jnp.where(axis_index(axis_name) == source, x, zeros_like(x))
+      return psum(masked, axis_name)
+
   but implemented in a hardware optimized way.
 
   If ``x`` is a pytree then the result is equivalent to mapping this function to
@@ -861,8 +860,8 @@ def _reduction_with_positional_batcher(
   if axis_index_groups is not None:
     raise NotImplementedError("axis_index_groups not supported in vmap collectives. "
                               "Please open a feature request!")
-  v = v if d is batching.not_mapped or d == 0 else _moveaxis(d, 0, v)
-  if d is batching.not_mapped:
+  v = v if d is None or d == 0 else _moveaxis(d, 0, v)
+  if d is None:
     unmapped_axes, unmapped_vals_in = transform_unmapped(0, v)
     return (prim.bind(unmapped_vals_in, axes=unmapped_axes)
             if prim is psum_invariant_p else
@@ -886,7 +885,7 @@ def _reduction_batcher(prim, v, d, *, axes, axis_index_groups):
                           for axis in axes),
                     v))
   # _reduction_with_positional_batcher moves all map dims to 0
-  return val_out, d if d is batching.not_mapped else 0
+  return val_out, d if d is None else 0
 
 def _batched_reduction_collective(prim, if_unmapped, axis_data, vals_in,
                                   dims_in, axes, axis_index_groups):
@@ -919,7 +918,7 @@ def _batched_reduction_collective(prim, if_unmapped, axis_data, vals_in,
       lambda d, v: (tuple(axis + (axis >= d) if isinstance(axis, int) else axis
                           if axis != axis_data.name else d for axis in axes),
                     v))
-  return val_out, batching.not_mapped
+  return val_out, None
 
 def _replica_groups(axis_ctx, axis_name, axis_index_groups):
   replica_groups = pxla.axis_groups(axis_ctx, axis_name)
@@ -1024,7 +1023,8 @@ def _allreduce_lowering(prim, pos_fn, ctx, arg, *, axes, axis_index_groups):
       reducer_ctx = ctx.replace(primitive=None,
                                 avals_in=[scalar_aval] * 2, avals_out=[scalar_aval])
       out_nodes = lower_reducer(reducer_ctx, *reducer_block.arguments)
-      hlo.return_(mlir.flatten_ir_values(out_nodes))
+      flat_out_nodes, _ = mlir.ir_tree_registry.flatten(out_nodes)
+      hlo.return_(flat_out_nodes)
     return op.result
   return [all_reduce(aval_in, arg)]
 
@@ -1133,7 +1133,7 @@ def _ppermute_batcher(axis_data, vals_in, dims_in, axis_name, perm):
     return ppermute_p.bind(v, perm=perm, axis_name=remaining_axes), d
   assert axis_name[0] == frame_name, "ppermute batcher called with a wrong axis!"
   assert len(perm) == axis_size, "Permutation doesn't match the axis size!"
-  if d is batching.not_mapped:
+  if d is None:
     return v, d
   perm_indices = np.zeros(axis_size, dtype=int)
   for src, dst in perm:
@@ -1153,7 +1153,7 @@ mlir.register_lowering(ppermute_p, _ppermute_lowering)
 batching.fancy_primitive_batchers[ppermute_p] = _ppermute_batcher
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SingleSideCollectiveEffect(core.Effect):
   __str__ = lambda _: "one-sided communication"
   def __hash__(self):
@@ -1184,9 +1184,6 @@ def _psend_lowering_gpu(ctx, x, *, axis_name, perm):
   if not isinstance(axis_ctx, SPMDAxisContext):
     raise NotImplementedError("psend currently only supports manual sharding")
 
-  sharding = xc.OpSharding()
-  sharding.type = xc.OpSharding.Type.MANUAL
-  mlir.set_sharding(ctx.module_context, send_op, sharding)
   return send_op.results
 
 
@@ -1227,10 +1224,6 @@ def _precv_lowering_gpu(ctx, token, *, out_shape, axis_name, perm):
   axis_ctx = ctx.module_context.axis_context
   if not isinstance(axis_ctx, SPMDAxisContext):
     raise NotImplementedError("precv currently only supports manual sharding")
-
-  sharding = xc.OpSharding()
-  sharding.type = xc.OpSharding.Type.MANUAL
-  mlir.set_sharding(ctx.module_context, recv_op, sharding)
 
   # recv_op should return an array of [RankedTensorType, StableHlo.token]; we
   # only need the tensor.
@@ -1275,7 +1268,7 @@ def _pbroadcast_batcher(axis_data, vals_in, dims_in, axis_name, source):
   assert source >= 0 and source < axis_size, "collective broadcast doesn't fit in the axis size!"
   if axis_size == 1 and remaining_axes:
     return pbroadcast_p.bind(v, source=source, axis_name=remaining_axes), d
-  if d is batching.not_mapped:
+  if d is None:
     return v, d
   return v.take([source] * axis_size, d), d
 
@@ -1426,7 +1419,7 @@ def _all_to_all_batched_collective(axis_data, vals_in, dims_in,
       vals_in, dims_in, axis_name=axis_name, split_axis=split_axis,
       concat_axis=concat_axis, axis_index_groups=axis_index_groups, tiled=tiled)
 
-  if d is batching.not_mapped:
+  if d is None:
     # TODO(sharadmv,apaszke): Remove this broadcast that comes from
     # all_gather_transpose and instead avoid using all_to_all in
     # all_gather_transpose.
@@ -1879,7 +1872,7 @@ def _all_gather_transpose_rule(cts, x, *, all_gather_dimension, axis_name,
 def _all_gather_batcher(prim, vals_in, dims_in, *, all_gather_dimension, axis_name,
                         axis_index_groups, axis_size, tiled):
   (x,), (d,) = vals_in, dims_in
-  if d is not batching.not_mapped:
+  if d is not None:
     if d <= all_gather_dimension:
       all_gather_dimension += 1
     elif not tiled:  # Tiled all-gather doesn't modify the set of dimensions
@@ -1921,7 +1914,7 @@ def _all_gather_batched_collective(prim, axis_data, vals_in, dims_in,
   if len(axis_name) > 1:
     raise NotImplementedError("Please open a feature request!")
   assert axis_name == (frame_name,), "batcher called with wrong axis name"
-  if d is batching.not_mapped:
+  if d is None:
     out_shape = list(np.shape(x))
     out_shape.insert(all_gather_dimension, axis_size)
     broadcast_dims = [i for i in range(len(out_shape)) if i != all_gather_dimension]
@@ -1930,7 +1923,7 @@ def _all_gather_batched_collective(prim, axis_data, vals_in, dims_in,
     y = _moveaxis(d, all_gather_dimension, x)
   if tiled:
     y = _foldaxis(all_gather_dimension, y)
-  return y, batching.not_mapped
+  return y, None
 
 all_gather_p = core.Primitive('all_gather')
 all_gather_p.def_effectful_abstract_eval(_all_gather_effectful_abstract_eval)
@@ -2077,7 +2070,8 @@ def _reduce_scatter_lowering(
                               avals_in=[scalar_aval] * 2,
                               avals_out=[scalar_aval])
     out_nodes = lower_reducer(reducer_ctx, *reducer_block.arguments)
-    hlo.return_(mlir.flatten_ir_values(out_nodes))
+    flat_out_nodes, _ = mlir.ir_tree_registry.flatten(out_nodes)
+    hlo.return_(flat_out_nodes)
 
   if tiled:
     return op.results
@@ -2161,7 +2155,7 @@ def _reduce_scatter_collective(axis_data, vals_in, dims_in,
   if len(axis_name) > 1:
     raise NotImplementedError("Please open a feature request!")
   assert axis_name == (frame_name,), "batcher called with wrong axis name"
-  if d is batching.not_mapped:
+  if d is None:
     y, dy = x * axis_size, scatter_dimension
   else:
     y, dy = lax.reduce(x, 0., lax.add, (d,)), scatter_dimension

@@ -19,10 +19,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence, Set
 import contextlib
-import enum
 from functools import partial
 import math
-import types
 from typing import Any, cast
 
 from jax._src import ad_util
@@ -30,6 +28,7 @@ from jax._src import api
 from jax._src import api_util
 from jax._src import config
 from jax._src import core as jax_core
+from jax._src import deprecations
 from jax._src import effects
 from jax._src import hijax
 from jax._src import linear_util as lu
@@ -291,14 +290,7 @@ def _pallas_call_jvp_rule(
       jvp_jaxpr.invars, [len(primals), grid_mapping.num_outputs, len(tangents)]
   )
   invars = (*primal_refs, *tangent_refs, *primal_out_refs, *tangent_out_refs)
-  effs = []
-  for eff in jvp_jaxpr.effects:
-    if isinstance(eff, effects.JaxprInputEffect):
-      eff = eff.replace(
-          input_index=invars.index(jvp_jaxpr.invars[eff.input_index])
-      )
-    effs.append(eff)
-  jvp_jaxpr = jvp_jaxpr.replace(invars=invars, effects=effs)
+  jvp_jaxpr = jvp_jaxpr.replace(invars=invars)
   if debug:
     print(f"\nThe jaxpr for the jvp of pallas_call {debug_info.func_src_info}:")
     print(jvp_jaxpr)
@@ -359,7 +351,7 @@ def _batch_block_mapping(
     if not isinstance(unflat_indices, tuple):
       unflat_indices = (unflat_indices,)
     unflat_indices = list(unflat_indices)
-    if dim is not batching.not_mapped:
+    if dim is not None:
       unflat_indices.insert(dim, new_idx)
     return tuple(unflat_indices)
   idx_avals = [pallas_core.index_map_grid_aval, *block_mapping.index_map_jaxpr.in_avals]
@@ -374,7 +366,7 @@ def _batch_block_mapping(
         idx_avals)
   new_index_map_out_tree = out_tree_thunk()
   shape = block_mapping.block_shape
-  if dim is batching.not_mapped:
+  if dim is None:
     new_block_shape = shape
     new_array_aval = block_mapping.array_aval
   else:
@@ -416,7 +408,7 @@ def _broadcast_input_output_aliases(
   for input_index, _ in input_output_aliases:
     dim = dims_[input_index]
     dims_[input_index] = 0
-    if dim is batching.not_mapped:
+    if dim is None:
       args_[input_index] = batching.broadcast(
           args_[input_index], axis_size, 0, None)
     elif dim != 0:
@@ -460,7 +452,7 @@ def _batch_with_explicit_loop(
   (axis_size,) = {
       arg.shape[dim]
       for arg, dim in zip(args, dims)
-      if dim is not batching.not_mapped
+      if dim is not None
   }
 
   args, dims = _broadcast_input_output_aliases(
@@ -485,7 +477,7 @@ def _batch_with_explicit_loop(
     for arg, dim in zip(args, dims):
       # If the argument is mapped, extract a slice of size 1 in the mapped
       # dimension at the current index.
-      if dim is batching.not_mapped:
+      if dim is None:
         batch_args.append(arg)
       else:
         batch_args.append(
@@ -569,7 +561,7 @@ def _pallas_call_batching_rule(
 
   def _maybe_squeeze_out_bdim(x: jax_typing.Array, bdim: int | batching.NotMapped
                               ) -> jax_typing.Array:
-    return x if bdim is batching.not_mapped else jnp.squeeze(x, axis=bdim)
+    return x if bdim is None else jnp.squeeze(x, axis=bdim)
 
   # this is the _global_ axis size if axis_data.explicit_mesh_axis is not None
   # we want to convert it to the local axis size
@@ -618,13 +610,13 @@ def _pallas_call_batching_rule(
       dims, [grid_mapping.num_dynamic_grid_bounds]
   )
   if all(
-      bdim is batching.not_mapped or arg.shape[bdim] == 1
+      bdim is None or arg.shape[bdim] == 1
       for arg, bdim in zip(dynamic_grid_args, dynamic_grid_dims)
   ):
     dynamic_grid_args = safe_map(
         _maybe_squeeze_out_bdim, dynamic_grid_args, dynamic_grid_dims
     )
-  elif any(bdim is not batching.not_mapped for bdim in dynamic_grid_dims):
+  elif any(bdim is not None for bdim in dynamic_grid_dims):
     # TODO(amagni, sharadmv): Explore possibility of batching dynamic grid
     # bounds.
     if ema:
@@ -655,11 +647,11 @@ def _pallas_call_batching_rule(
     # vmapping over 1-sized dimensions, we can just get rid of the dimensions
     # and pretend we were never vmapped over them at all.
     if all(
-        bdim is batching.not_mapped or arg.shape[bdim] == 1
+        bdim is None or arg.shape[bdim] == 1
         for arg, bdim in zip(scalar_args, scalar_bdims)
     ):
       scalar_args = safe_map(_maybe_squeeze_out_bdim, scalar_args, scalar_bdims)
-      scalar_bdims = [batching.not_mapped] * len(scalar_args)
+      scalar_bdims = [None] * len(scalar_args)
       args = (*scalar_args, *args)
       dims = (*scalar_bdims, *bdims)
     else:
@@ -846,16 +838,6 @@ def _trace_kernel_to_jaxpr(
   return jaxpr, tuple(consts)
 
 
-_PALLAS_USE_MOSAIC_GPU = config.bool_state(
-    "jax_pallas_use_mosaic_gpu",
-    default=config.bool_env("JAX_PALLAS_USE_MOSAIC_GPU", True),
-    help=(
-        "If True, lower Pallas kernels to the experimental Mosaic GPU"
-        " dialect, instead of Triton IR."
-    ),
-)
-
-
 def _unsupported_lowering_error(platform: str) -> Exception:
   return ValueError(
       f"Cannot lower pallas_call on platform: {platform}. To use Pallas on GPU,"
@@ -870,16 +852,34 @@ def _pallas_call_lowering(
   if params['jaxpr'].constvars:
     raise ValueError('Cannot lower a pallas_call with constants.')
   if interpret:
-    if isinstance(interpret, InterpretParams):
-      impl = partial(mosaic_tpu_interpret.interpret_pallas_call,  # pyrefly: ignore[missing-attribute]
-                     interpret_params=interpret,
-                     **params)
-    elif isinstance(interpret, InterpretGPUParams):
-      impl = partial(mosaic_gpu_interpret.interpret_pallas_call,  # pyrefly: ignore[missing-attribute]
-                     interpret_params=interpret,
-                     **params)
+    impl = partial(hlo_interpreter.pallas_call_hlo_interpret, **params)
+
+    try:
+      from jax._src.pallas.mosaic.interpret import interpret_pallas_call as mosaic_tpu_interpret  # pyrefly: ignore[missing-import]
+      from jax._src.pallas.mosaic.interpret import params as tpu_params  # pyrefly: ignore[missing-import]
+    except ImportError:
+      pass
     else:
-      impl = partial(hlo_interpreter.pallas_call_hlo_interpret, **params)
+      if isinstance(interpret, tpu_params.InterpretParams):
+        impl = partial(
+            mosaic_tpu_interpret.interpret_pallas_call,
+            interpret_params=interpret,
+            **params,
+        )
+
+    try:
+      from jax._src.pallas.mosaic_gpu.interpret import interpret_pallas_call as mosaic_gpu_interpret  # pyrefly: ignore[missing-import]
+      from jax._src.pallas.mosaic_gpu.interpret import params as gpu_params  # pyrefly: ignore[missing-import]
+    except ImportError:
+      pass
+    else:
+      if isinstance(interpret, gpu_params.InterpretGPUParams):
+        impl = partial(
+            mosaic_gpu_interpret.interpret_pallas_call,
+            interpret_params=interpret,
+            **params,
+        )
+
     return mlir.lower_fun(impl, multiple_results=True)(ctx, *in_nodes)
 
   def cpu_lowering(
@@ -900,8 +900,11 @@ def _pallas_call_lowering(
       if rule is not None:
         return rule(ctx, *in_nodes, **params)
 
-    if mosaic_tpu_backend is None:
-      raise _unsupported_lowering_error("tpu")
+    try:
+      from jax._src.pallas.mosaic import pallas_call_registration as mosaic_tpu_backend  # pyrefly: ignore[missing-import]
+    except ImportError:
+      raise _unsupported_lowering_error("tpu") from None
+
     return mosaic_tpu_backend.pallas_call_tpu_lowering_rule(
         ctx, *in_nodes, **params
     )
@@ -920,29 +923,51 @@ def _pallas_call_lowering(
         return rule(ctx, *in_nodes, compiler_params=compiler_params, **params)
 
     backend: Any = None
-    if mosaic_gpu_backend is not None:
-      from jax._src.pallas.mosaic_gpu import core as mgpu_core
+
+    try:
+      from jax._src.pallas.mosaic_gpu import core as mgpu_core  # pyrefly: ignore[missing-import]
+      from jax._src.pallas.mosaic_gpu import pallas_call_registration as mosaic_gpu_backend  # pyrefly: ignore[missing-import]
+    except ImportError:
+      pass
+    else:
       if (
           isinstance(compiler_params, mgpu_core.CompilerParams)
-          or (compiler_params is None and _PALLAS_USE_MOSAIC_GPU.value)
+          or (compiler_params is None and
+              config.jax_pallas_use_mosaic_gpu.value)
       ):
         backend = mosaic_gpu_backend
-    if triton_backend is not None:
-      from jax._src.pallas.triton import core as triton_core
+
+      if backend is mosaic_gpu_backend:
+        if is_rocm:
+          raise ValueError(
+              "Mosaic GPU does not yet support HCU devices. "
+              "Use ``compiler_params=pltriton.CompilerParams()`` for ROCm."
+          )
+
+        if ctx.primitive is pallas_call_p:
+          deprecations.warn(
+              "jax-pallas-call-mgpu",
+              "Using ``pl.pallas_call`` for Mosaic GPU kernels is deprecated."
+              " Support for that will be removed in a future JAX version."
+              " Please migrate to ``plgpu.kernel``.",
+              stacklevel=2,
+          )
+
+    try:
+      from jax._src.pallas.triton import core as triton_core  # pyrefly: ignore[missing-import]
+      from jax._src.pallas.triton import pallas_call_registration as triton_backend  # pyrefly: ignore[missing-import]
+    except ImportError:
+      pass
+    else:
       if (
           isinstance(compiler_params, triton_core.CompilerParams)
-          or (compiler_params is None and not _PALLAS_USE_MOSAIC_GPU.value)
+          or (compiler_params is None and
+              not config.jax_pallas_use_mosaic_gpu.value)
       ):
         backend = triton_backend
 
     if backend is None:
       raise _unsupported_lowering_error("gpu")
-
-    if is_rocm and backend is mosaic_gpu_backend:
-      raise ValueError(
-          "Mosaic GPU does not yet support HCU/ROCm devices. "
-          "Use ``compiler_params=pltriton.CompilerParams()`` for ROCm."
-      )
 
     return backend.pallas_call_lowering(
         ctx, *in_nodes, compiler_params=compiler_params, **params
@@ -1345,43 +1370,12 @@ def _pallas_call(
           cost_estimate=cost_estimate,
           metadata=FrozenDict(metadata) if metadata is not None else None,
           name=name,
+          # If we're running under GPU Interpret Mode, save the kernel arg
+          # transforms. Checks the string name to avoid a conditional import.
+          # TODO(jburnim): Clean this up.
+          **(dict(kernel_arg_transforms=kernel_arg_transforms)
+             if type(interpret).__name__ == "InterpretGPUParams" else {}),
       )
     out = tree_util.tree_unflatten(out_tree, out_flat)
     return out
   return wrapped
-
-
-# We import the TPU backend at the top level because it defines flags. Note that
-# we can only do that at the bottom of this file, because it also depends on
-# this module already being initialized.
-
-try:
-  from jax._src.pallas.mosaic import pallas_call_registration as mosaic_tpu_backend
-except ImportError:
-  mosaic_tpu_backend = None
-
-
-try:
-  from jax._src.pallas.mosaic_gpu import pallas_call_registration as mosaic_gpu_backend
-except ImportError:
-  mosaic_gpu_backend = None
-
-
-try:
-  from jax._src.pallas.triton import pallas_call_registration as triton_backend
-except ImportError:
-  triton_backend = None
-
-try:
-  from jax._src.pallas.mosaic.interpret import interpret_pallas_call as mosaic_tpu_interpret
-  from jax._src.pallas.mosaic.interpret.params import InterpretParams
-except ImportError:
-  mosaic_tpu_interpret = None
-  InterpretParams = types.new_class("_NoInstances", (enum.Enum,))
-
-try:
-  from jax._src.pallas.mosaic_gpu.interpret import interpret_pallas_call as mosaic_gpu_interpret
-  from jax._src.pallas.mosaic_gpu.interpret.params import InterpretGPUParams
-except ImportError:
-  mosaic_gpu_interpret = None
-  InterpretGPUParams = types.new_class("_NoInstances", (enum.Enum,))
