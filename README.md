@@ -2,13 +2,12 @@
 
 > [!IMPORTANT]
 > **jax-das** 是面向 DAS 架构的 jax 下游适配发行版，
-> 本项目基于 [ROCm/jax](https://github.com/ROCm/jax) 的 `rocm-jaxlib-v0.10.1`（`45f2ff649014d665fdc0dadd094e22173cf67da0`）基线构建并集成 DAS 支持。
-> 本项目不是 jax 官方发行版，而是基于[ROCm/jax](https://github.com/ROCm/jax/tree/rocm-jaxlib-v0.10.1) 二次开发；ROCm jax 源自[jax-ml/jax](https://github.com/jax-ml/jax/tree/jax-v0.10.1)二次开发。
+> 本项目基于 [ROCm/jax](https://github.com/ROCm/jax) 的 `rocm-jaxlib-v0.10.2`（`db744a7ed2a66ec1f2260c9546b2cb7d516507f4`）基线构建并集成 DAS 支持。
+> 本项目不是 jax 官方发行版，而是基于[ROCm/jax](https://github.com/ROCm/jax/tree/rocm-jaxlib-v0.10.2) 二次开发；ROCm jax 源自[jax-ml/jax](https://github.com/jax-ml/jax/tree/jax-v0.10.2)二次开发。
 
 * **目标架构：** jax
-* **上游版本：** rocm-jaxlib-v0.10.1
-* **上游基线：** `https://github.com/ROCm/jax/tree/45f2ff649014d665fdc0dadd094e22173cf67da0`
-* **XLA 依赖：** [HYGON-AI/xla-das](https://github.com/HYGON-AI/xla-das/tree/8e709b7753a3a135e80c7b1b2fdba601a06dd168)，固定版本与 SHA256 见 [revision.bzl](third_party/xla/revision.bzl)，构建时由 Bazel 自动下载。
+* **上游版本：** rocm-jaxlib-v0.10.2
+* **上游基线：** `https://github.com/ROCm/jax/tree/db744a7ed2a66ec1f2260c9546b2cb7d516507f4`
 * **源码编译：** [BUILDING.md](docs/das/BUILDING.md)
 * **已知问题：** [BUILDING.md 中的已知问题](docs/das/BUILDING.md#已知问题)
 * **Python 发布包名：** `jax-das`
